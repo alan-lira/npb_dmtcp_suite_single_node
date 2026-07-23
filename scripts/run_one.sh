@@ -13,15 +13,18 @@ source "${SCRIPT_DIR}/experiment_config.sh"
 
 usage() {
   cat <<USAGE
-Usage (suite syntax):
+Usage:
+  $0 <bt|cg> <mpi-ranks> <baseline|cr> <checkpoint-delay-seconds> <rep> [delete-checkpoints|keep-checkpoints]
+
+Compatibility syntax used by existing suite callers:
   $0 <bt|cg> <mpi-ranks> <baseline|cr> <checkpoint-percent> <checkpoint-delay-seconds> <rep> [delete-checkpoints|keep-checkpoints]
 
-Usage (legacy four-argument legacy syntax):
+Legacy syntax:
   $0 <mpi-ranks> <baseline|cr> <checkpoint-delay-seconds> <rep> [bt|cg] [delete-checkpoints|keep-checkpoints]
 
 Examples:
-  $0 bt 25 baseline 0 0 1 keep-checkpoints
-  $0 bt 25 cr 10 137.377947557 1 keep-checkpoints
+  $0 bt 25 baseline 0 1 keep-checkpoints
+  $0 bt 25 cr 60 1 keep-checkpoints
   $0 25 cr 60 1
   $0 8 cr 60 1 cg keep-checkpoints
 USAGE
@@ -47,16 +50,17 @@ is_nonnegative_number() {
 }
 
 # ---------------------------------------------------------------------------
-# Accept both the current package interface and the original four-argument
-# interface.  The execution engine below is shared by both modes.
+# Accept the primary direct interface, the existing suite-caller interface,
+# and the original four-argument interface. The execution engine below is
+# shared by all modes.
 # ---------------------------------------------------------------------------
-INVOCATION_MODE="suite"
-CHECKPOINT_PERCENT="0"
+INVOCATION_MODE="direct"
+CHECKPOINT_PERCENT="${CHECKPOINT_PERCENTAGE_LABEL:-0}"
 CHECKPOINT_LABEL=""
 CHECKPOINT_CLEANUP_MODE_ARG=""
 
 if [ "$#" -ge 1 ] && [[ "${1,,}" =~ ^(bt|cg)$ ]]; then
-  if [ "$#" -lt 6 ] || [ "$#" -gt 7 ]; then
+  if [ "$#" -lt 3 ]; then
     usage
     exit 1
   fi
@@ -64,10 +68,43 @@ if [ "$#" -ge 1 ] && [[ "${1,,}" =~ ^(bt|cg)$ ]]; then
   BENCHMARK="${1,,}"
   NP="$2"
   SCENARIO="${3,,}"
-  CHECKPOINT_PERCENT="$4"
-  CHECKPOINT_DELAY_SECONDS="$5"
-  REP="$6"
-  CHECKPOINT_CLEANUP_MODE_ARG="${7:-}"
+
+  case "$#" in
+    5)
+      CHECKPOINT_DELAY_SECONDS="$4"
+      REP="$5"
+      ;;
+    6)
+      case "${6,,}" in
+        delete-checkpoints|keep-checkpoints)
+          CHECKPOINT_DELAY_SECONDS="$4"
+          REP="$5"
+          CHECKPOINT_CLEANUP_MODE_ARG="${6,,}"
+          ;;
+        *)
+          is_positive_integer "$6" || {
+            usage
+            exit 1
+          }
+          INVOCATION_MODE="suite-compat"
+          CHECKPOINT_PERCENT="$4"
+          CHECKPOINT_DELAY_SECONDS="$5"
+          REP="$6"
+          ;;
+      esac
+      ;;
+    7)
+      INVOCATION_MODE="suite-compat"
+      CHECKPOINT_PERCENT="$4"
+      CHECKPOINT_DELAY_SECONDS="$5"
+      REP="$6"
+      CHECKPOINT_CLEANUP_MODE_ARG="${7,,}"
+      ;;
+    *)
+      usage
+      exit 1
+      ;;
+  esac
 else
   INVOCATION_MODE="legacy"
   if [ "$#" -lt 4 ] || [ "$#" -gt 6 ]; then
@@ -97,7 +134,6 @@ else
         ;;
     esac
   fi
-  CHECKPOINT_PERCENT="0"
 fi
 
 if [ -n "${CHECKPOINT_CLEANUP_MODE_ARG}" ]; then
@@ -118,10 +154,8 @@ is_positive_integer "${NP}" || fail "MPI rank count must be a positive integer."
 is_positive_integer "${REP}" || fail "repetition number must be a positive integer."
 is_nonnegative_number "${CHECKPOINT_DELAY_SECONDS}" || fail "checkpoint delay must be a nonnegative number."
 
-if [ "${INVOCATION_MODE}" = "suite" ]; then
-  [[ "${CHECKPOINT_PERCENT}" =~ ^[0-9]+$ ]] \
-    || fail "checkpoint percentage must be a nonnegative integer."
-fi
+[[ "${CHECKPOINT_PERCENT}" =~ ^[0-9]+$ ]] \
+  || fail "checkpoint percentage label must be a nonnegative integer."
 
 case "${CHECKPOINT_CLEANUP_MODE}" in
   delete-checkpoints|keep-checkpoints) ;;
@@ -136,9 +170,8 @@ esac
 if [ "${SCENARIO}" = "baseline" ]; then
   [ "${CHECKPOINT_DELAY_SECONDS}" = "0" ] \
     || fail "baseline runs require checkpoint delay 0."
-  if [ "${INVOCATION_MODE}" = "suite" ] && [ "${CHECKPOINT_PERCENT}" != "0" ]; then
-    fail "baseline runs require checkpoint percentage 0."
-  fi
+  [ "${CHECKPOINT_PERCENT}" = "0" ] \
+    || fail "baseline runs require checkpoint percentage label 0."
 else
   python3 - "${CHECKPOINT_DELAY_SECONDS}" <<'PY' \
     || fail "CR runs require a checkpoint delay greater than zero."
@@ -146,9 +179,9 @@ import sys
 raise SystemExit(0 if float(sys.argv[1]) > 0 else 1)
 PY
 
-  if [ "${INVOCATION_MODE}" = "suite" ] && \
+  if [ "${CHECKPOINT_PERCENT}" != "0" ] && \
      { [ "${CHECKPOINT_PERCENT}" -le 0 ] || [ "${CHECKPOINT_PERCENT}" -ge 100 ]; }; then
-    fail "suite-mode CR checkpoint percentage must be between 1 and 99."
+    fail "CR checkpoint percentage label must be between 1 and 99."
   fi
 fi
 
@@ -201,8 +234,16 @@ PY
   RUN_NAME="${BENCHMARK}${NPB_CLASS}_np${NP}_${SCENARIO}_t${CHECKPOINT_LABEL}_rep${REP}"
 elif [ "${SCENARIO}" = "baseline" ]; then
   RUN_NAME="${BENCHMARK}${NPB_CLASS}_np${NP}_baseline_rep${REP}"
-else
+elif [ "${CHECKPOINT_PERCENT}" != "0" ]; then
   RUN_NAME="${BENCHMARK}${NPB_CLASS}_np${NP}_cr_p${CHECKPOINT_PERCENT}_rep${REP}"
+else
+  CHECKPOINT_LABEL="$(python3 - "${CHECKPOINT_DELAY_SECONDS}" <<'PY'
+import sys
+value = sys.argv[1]
+print(value.replace('.', 'p'))
+PY
+)"
+  RUN_NAME="${BENCHMARK}${NPB_CLASS}_np${NP}_cr_t${CHECKPOINT_LABEL}_rep${REP}"
 fi
 
 RUN_DIR="${RESULTS_ROOT}/${RUN_NAME}"
@@ -621,7 +662,7 @@ write_zero_cr_metrics() {
   echo "MPI ranks: ${NP}"
   echo "Scenario: ${SCENARIO}"
   echo "Repetition: ${REP}"
-  echo "Checkpoint percentage: ${CHECKPOINT_PERCENT}"
+  echo "Checkpoint percentage label: ${CHECKPOINT_PERCENT}"
   echo "Checkpoint target seconds: ${CHECKPOINT_DELAY_SECONDS}"
   echo "Output root: ${OUTPUT_ROOT}"
   echo "Results root: ${RESULTS_ROOT}"
@@ -648,7 +689,7 @@ printf '%s\n' "============================================================"
 printf '%s\n' "${BENCHMARK^^}.${NPB_CLASS} | MPI ranks=${NP} | scenario=${SCENARIO} | repetition=${REP}"
 printf '%s\n' "Output directory: ${RUN_DIR}"
 if [ "${SCENARIO}" = "cr" ]; then
-  if [ "${INVOCATION_MODE}" = "suite" ]; then
+  if [ "${CHECKPOINT_PERCENT}" != "0" ]; then
     printf '%s\n' "Checkpoint target: ${CHECKPOINT_PERCENT}% (${CHECKPOINT_DELAY_SECONDS} seconds after launch)"
   else
     printf '%s\n' "Checkpoint target: ${CHECKPOINT_DELAY_SECONDS} seconds after launch"

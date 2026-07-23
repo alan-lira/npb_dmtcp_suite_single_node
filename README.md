@@ -148,7 +148,7 @@ Then run the build and experiments normally:
 ```bash
 BINARY_ROOT=/opt/npb-binaries \
 RESULTS_ROOT=/scratch/npb-results \
-./scripts/run_one.sh bt 25 cr 10 60 1 keep-checkpoints
+./scripts/run_one.sh bt 25 cr delay 60 1 keep-checkpoints
 ```
 
 Use absolute paths for external output locations.
@@ -191,43 +191,84 @@ OUTPUT_ROOT=/scratch/npb-dmtcp-output \
 
 ### 6. Run a single experiment
 
-Primary syntax:
+Baseline syntax:
 
 ```bash
-./scripts/run_one.sh <bt|cg> <mpi-ranks> <baseline|cr> \
-  <checkpoint-percent> <checkpoint-delay-seconds> <rep> \
+./scripts/run_one.sh <bt|cg> <mpi-ranks> baseline <rep> \
+  [delete-checkpoints|keep-checkpoints]
+```
+
+Checkpoint/restart runs support two mutually exclusive target modes.
+
+Percentage mode:
+
+```bash
+./scripts/run_one.sh <bt|cg> <mpi-ranks> cr percent \
+  <checkpoint-percent> <rep> \
+  [delete-checkpoints|keep-checkpoints]
+```
+
+Direct-delay mode:
+
+```bash
+./scripts/run_one.sh <bt|cg> <mpi-ranks> cr delay \
+  <checkpoint-delay-seconds> <rep> \
   [delete-checkpoints|keep-checkpoints]
 ```
 
 BT.D baseline:
 
 ```bash
-./scripts/run_one.sh bt 25 baseline 0 0 1 keep-checkpoints
+./scripts/run_one.sh bt 25 baseline 1 keep-checkpoints
 ```
 
-BT.D checkpoint/restart after 60 seconds:
+BT.D checkpoint/restart at 10% of the matching baseline mean:
 
 ```bash
-./scripts/run_one.sh bt 25 cr 10 60 1 keep-checkpoints
+./scripts/run_one.sh bt 25 cr percent 10 1 keep-checkpoints
 ```
 
-CG.D checkpoint/restart:
+Percentage mode requires at least one successful matching baseline run in the
+configured results directory. The script calculates the absolute checkpoint
+delay as:
+
+```text
+checkpoint delay = baseline mean × checkpoint percentage / 100
+```
+
+An explicit baseline value may be supplied instead of reading previous baseline
+results:
 
 ```bash
-./scripts/run_one.sh cg 8 cr 25 60 1 keep-checkpoints
+BASELINE_REFERENCE_SECONDS=1373.779475573 \
+./scripts/run_one.sh bt 25 cr percent 10 1 keep-checkpoints
+```
+
+BT.D checkpoint/restart with a direct 60-second delay:
+
+```bash
+./scripts/run_one.sh bt 25 cr delay 60 1 keep-checkpoints
+```
+
+CG.D checkpoint/restart with a direct 60-second delay:
+
+```bash
+./scripts/run_one.sh cg 8 cr delay 60 1 keep-checkpoints
 ```
 
 With a custom output path:
 
 ```bash
 OUTPUT_ROOT=/scratch/npb-dmtcp-output \
-./scripts/run_one.sh bt 25 cr 10 60 1 keep-checkpoints
+./scripts/run_one.sh bt 25 cr delay 60 1 keep-checkpoints
 ```
 
-For a direct `run_one.sh` call, the percentage is a directory/metadata label.
+The `percent` and `delay` modes cannot be combined.
 
-The checkpoint is actually requested after `checkpoint-delay-seconds`.
-`run_all.sh` calculates that delay from the measured baseline mean.
+Percentage-mode run directories use the percentage, for example `btD_np25_cr_p10_rep1`.
+
+Direct-delay run directories use the absolute delay, for example
+`btD_np25_cr_t60_rep1`.
 
 
 ### 7. Run the configured experiment matrix

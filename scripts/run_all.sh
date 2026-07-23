@@ -186,7 +186,7 @@ for benchmark in "${BENCHMARKS[@]}"; do
 
       for repetition in "${BASELINE_REPETITIONS[@]}"; do
         "${SCRIPT_DIR}/run_one.sh" \
-          "${benchmark}" "${np}" baseline 0 0 "${repetition}" \
+          "${benchmark}" "${np}" baseline "${repetition}" \
           "${CHECKPOINT_CLEANUP_MODE}"
       done
     else
@@ -230,7 +230,7 @@ for benchmark in "${BENCHMARKS[@]}"; do
       for repetition in "${CR_REPETITIONS[@]}"; do
         BASELINE_REFERENCE_SECONDS="${BASELINE_MEAN}" \
           "${SCRIPT_DIR}/run_one.sh" \
-            "${benchmark}" "${np}" cr "${percentage}" "${TARGET_SECONDS}" "${repetition}" \
+            "${benchmark}" "${np}" cr percent "${percentage}" "${repetition}" \
             "${CHECKPOINT_CLEANUP_MODE}"
 
         CR_DIR="${RESULTS_ROOT}/${benchmark}${NPB_CLASS}_np${np}_cr_p${percentage}_rep${repetition}"
