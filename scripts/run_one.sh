@@ -453,16 +453,32 @@ verify_npb_output() {
 monitor_background_process() {
   local pid="$1"
   local label="$2"
-  local start_ns="$3"
+  local phase_start_ns="$3"
   local interval="${4:-30}"
+  local overall_start_ns="${5:-}"
   local next_report=$((SECONDS + interval))
 
   while pid_is_active "${pid}"; do
     sleep 1
+
     if [ "${SECONDS}" -ge "${next_report}" ]; then
-      local elapsed
-      elapsed="$(elapsed_s "${start_ns}" "$(now_ns)")"
-      phase "${label}" "Still running; elapsed $(human_seconds "${elapsed}")."
+      local current_ns
+      local phase_elapsed
+
+      current_ns="$(now_ns)"
+      phase_elapsed="$(elapsed_s "${phase_start_ns}" "${current_ns}")"
+
+      if [ -n "${overall_start_ns}" ]; then
+        local overall_elapsed
+
+        overall_elapsed="$(elapsed_s "${overall_start_ns}" "${current_ns}")"
+        phase "${label}" \
+          "Still running; elapsed since latest restore: $(human_seconds "${phase_elapsed}") | since initial launch: $(human_seconds "${overall_elapsed}")."
+      else
+        phase "${label}" \
+          "Still running; elapsed $(human_seconds "${phase_elapsed}")."
+      fi
+
       next_report=$((SECONDS + interval))
     fi
   done
@@ -979,7 +995,12 @@ phase restore "Restore step took $(human_seconds "$(<dmtcp_restore_seconds.txt)"
 phase run "Restored ${BENCHMARK^^}.${NPB_CLASS} computation is continuing."
 
 POST_RESTORE_START_NS="${RESTORE_END_NS}"
-monitor_background_process "${RESTORED_PID}" run "${POST_RESTORE_START_NS}" "${PROGRESS_INTERVAL_SECONDS}"
+monitor_background_process \
+  "${RESTORED_PID}" \
+  run \
+  "${POST_RESTORE_START_NS}" \
+  "${PROGRESS_INTERVAL_SECONDS}" \
+  "${TOTAL_START_NS}"
 
 set +e
 wait "${RESTORED_PID}"

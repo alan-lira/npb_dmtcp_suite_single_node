@@ -106,7 +106,15 @@ under the repository-root `output/` directory:
     └── <run-name>/
 ```
 
-All generated repository artifacts can be redirected with **one variable**:
+The default output root is the repository-local `output/` directory and does
+not require an environment-variable override:
+
+```text
+<repository-root>/output/
+```
+
+All generated repository artifacts can instead be redirected with **one
+variable**:
 
 ```bash
 OUTPUT_ROOT=/scratch/npb-dmtcp-output
@@ -122,22 +130,34 @@ $OUTPUT_ROOT/results/<run-name>/
 Each run directory contains logs, metrics, DMTCP restart scripts, and, when
 `keep-checkpoints` is selected, the checkpoint files themselves.
 
-To use a custom output path for one command:
+To use the default repository-local output path for one command:
+
+```bash
+./scripts/run_all.sh
+```
+
+To use a custom output path for the same command:
 
 ```bash
 OUTPUT_ROOT=/scratch/npb-dmtcp-output \
 ./scripts/run_all.sh
 ```
 
-To use the same custom output path for multiple commands in the current shell:
+To use the default repository-local output path for multiple commands, run
+them normally:
+
+```bash
+./scripts/build_npb_bt_cg_d.sh
+./scripts/verify_single_node_environment.sh
+./scripts/run_all.sh
+```
+
+To use the same custom output path for multiple commands in the current shell,
+export `OUTPUT_ROOT` first and then run the same commands:
 
 ```bash
 export OUTPUT_ROOT=/scratch/npb-dmtcp-output
-```
 
-Then run the build and experiments normally:
-
-```bash
 ./scripts/build_npb_bt_cg_d.sh
 ./scripts/verify_single_node_environment.sh
 ./scripts/run_all.sh
@@ -182,7 +202,15 @@ NPB_ROOT=/scratch/NPB3.4-MPI \
 ./scripts/build_npb_bt_cg_d.sh
 ```
 
-Then verify the environment and binary linkage with the same path settings:
+Then verify the environment and binary linkage.
+
+With the default repository-local output path:
+
+```bash
+./scripts/verify_single_node_environment.sh
+```
+
+With a custom output path, use the same `OUTPUT_ROOT` value used during the build:
 
 ```bash
 OUTPUT_ROOT=/scratch/npb-dmtcp-output \
@@ -256,6 +284,12 @@ CG.D checkpoint/restart with a direct 60-second delay:
 ./scripts/run_one.sh cg 8 cr delay 60 1 keep-checkpoints
 ```
 
+With the default repository-local output path:
+
+```bash
+./scripts/run_one.sh bt 25 cr delay 60 1 keep-checkpoints
+```
+
 With a custom output path:
 
 ```bash
@@ -284,7 +318,19 @@ SOCKET_CLEANUP_SLEEP_SECONDS="10"
 DMTCP_EXPERIMENT_SIGNAL="30"
 ```
 
-Small validation:
+Small validation with the default repository-local output path:
+
+```bash
+BENCHMARKS_TEXT="bt" \
+MPI_RANKS_TEXT="25" \
+BASELINE_REPETITIONS_TEXT="1" \
+CR_REPETITIONS_TEXT="1" \
+CHECKPOINT_PERCENTAGES_TEXT="10" \
+CHECKPOINT_CLEANUP_MODE="keep-checkpoints" \
+./scripts/run_all.sh
+```
+
+Small validation with a custom output path:
 
 ```bash
 OUTPUT_ROOT=/scratch/npb-dmtcp-output \
