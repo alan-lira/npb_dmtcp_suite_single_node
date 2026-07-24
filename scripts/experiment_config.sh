@@ -9,14 +9,14 @@ set -euo pipefail
 
 # Shared configuration for the NPB/DMTCP experiment suite.
 #
-# Arrays are populated from space-separated text variables so the complete
-# experiment can be changed either here or from the command line:
+# List-valued matrix fields are populated from space-separated text variables,
+# while repetition settings are positive integer counts:
 #
 #   MPI_RANKS_TEXT="4 9 16" ./scripts/build_npb_bt_cg_d.sh
-#   MPI_RANKS_TEXT="4 9 16" ./scripts/run_all.sh
+#   BASELINE_REPETITIONS=3 CR_REPETITIONS=3 ./scripts/run_all.sh
 #
-# REPETITIONS_TEXT remains a backward-compatible shorthand that sets both
-# BASELINE_REPETITIONS_TEXT and CR_REPETITIONS_TEXT.
+# REPETITIONS remains a shorthand that sets both repetition counts when the
+# baseline and checkpoint/restart counts should be identical.
 
 CONFIG_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${CONFIG_DIR}/.." && pwd)"
@@ -73,14 +73,12 @@ REQUIRE_WORKING_STACK="${REQUIRE_WORKING_STACK:-true}"
 
 BENCHMARKS_TEXT="${BENCHMARKS_TEXT:-bt cg}"
 MPI_RANKS_TEXT="${MPI_RANKS_TEXT:-4}"
-BASELINE_REPETITIONS_TEXT="${BASELINE_REPETITIONS_TEXT:-${REPETITIONS_TEXT:-1 2 3}}"
-CR_REPETITIONS_TEXT="${CR_REPETITIONS_TEXT:-${REPETITIONS_TEXT:-1 2 3}}"
+BASELINE_REPETITIONS="${BASELINE_REPETITIONS:-${REPETITIONS:-3}}"
+CR_REPETITIONS="${CR_REPETITIONS:-${REPETITIONS:-3}}"
 CHECKPOINT_PERCENTAGES_TEXT="${CHECKPOINT_PERCENTAGES_TEXT:-25 50 75}"
 
 read -r -a BENCHMARKS <<< "${BENCHMARKS_TEXT}"
 read -r -a MPI_RANKS <<< "${MPI_RANKS_TEXT}"
-read -r -a BASELINE_REPETITIONS <<< "${BASELINE_REPETITIONS_TEXT}"
-read -r -a CR_REPETITIONS <<< "${CR_REPETITIONS_TEXT}"
 read -r -a CHECKPOINT_PERCENTAGES <<< "${CHECKPOINT_PERCENTAGES_TEXT}"
 
 # ---------------------------------------------------------------------------

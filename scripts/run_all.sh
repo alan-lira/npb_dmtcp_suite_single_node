@@ -63,11 +63,15 @@ fi
 
 if [ "${#BENCHMARKS[@]}" -eq 0 ] || \
    [ "${#MPI_RANKS[@]}" -eq 0 ] || \
-   [ "${#BASELINE_REPETITIONS[@]}" -eq 0 ] || \
-   [ "${#CR_REPETITIONS[@]}" -eq 0 ] || \
    [ "${#CHECKPOINT_PERCENTAGES[@]}" -eq 0 ]; then
-  fail "benchmark, rank, baseline-repetition, CR-repetition, and checkpoint-percentage lists must not be empty."
+  fail "benchmark, rank, and checkpoint-percentage lists must not be empty."
 fi
+
+[[ "${BASELINE_REPETITIONS}" =~ ^[1-9][0-9]*$ ]] \
+  || fail "BASELINE_REPETITIONS must be a positive integer; received '${BASELINE_REPETITIONS}'."
+
+[[ "${CR_REPETITIONS}" =~ ^[1-9][0-9]*$ ]] \
+  || fail "CR_REPETITIONS must be a positive integer; received '${CR_REPETITIONS}'."
 
 mkdir -p "${RESULTS_ROOT}"
 RESULTS_ROOT="$(cd -- "${RESULTS_ROOT}" && pwd)"
@@ -100,17 +104,12 @@ for percentage in "${CHECKPOINT_PERCENTAGES[@]}"; do
   fi
 done
 
-for repetition in "${BASELINE_REPETITIONS[@]}" "${CR_REPETITIONS[@]}"; do
-  [[ "${repetition}" =~ ^[1-9][0-9]*$ ]] \
-    || fail "repetitions must be positive integers; received '${repetition}'."
-done
-
 compute_baseline_mean() {
   local benchmark="$1"
   local np="$2"
-  shift 2
+  local repetition_count="$3"
 
-  python3 - "${RESULTS_ROOT}" "${benchmark}" "${NPB_CLASS}" "${np}" "$@" <<'PY'
+  python3 - "${RESULTS_ROOT}" "${benchmark}" "${NPB_CLASS}" "${np}" "${repetition_count}" <<'PY'
 from pathlib import Path
 import statistics
 import sys
@@ -119,10 +118,10 @@ results_root = Path(sys.argv[1])
 benchmark = sys.argv[2]
 npb_class = sys.argv[3]
 np = int(sys.argv[4])
-repetitions = [int(value) for value in sys.argv[5:]]
+repetition_count = int(sys.argv[5])
 
 values = []
-for repetition in repetitions:
+for repetition in range(1, repetition_count + 1):
     run_dir = results_root / f"{benchmark}{npb_class}_np{np}_baseline_rep{repetition}"
     status_file = run_dir / "run_status.txt"
     total_file = run_dir / "total_seconds.txt"
@@ -156,8 +155,8 @@ echo "NPB/DMTCP checkpoint/restore experiment suite"
 echo "Benchmarks:             ${BENCHMARKS[*]}"
 echo "NPB class:              ${NPB_CLASS}"
 echo "MPI ranks:              ${MPI_RANKS[*]}"
-echo "Baseline repetitions:   ${BASELINE_REPETITIONS[*]}"
-echo "CR repetitions:         ${CR_REPETITIONS[*]}"
+echo "Baseline repetitions:   ${BASELINE_REPETITIONS} (IDs 1-${BASELINE_REPETITIONS})"
+echo "CR repetitions:         ${CR_REPETITIONS} per percentage (IDs 1-${CR_REPETITIONS})"
 echo "Checkpoint percentages: ${CHECKPOINT_PERCENTAGES[*]}"
 echo "Run baselines:          ${RUN_BASELINE}"
 echo "Existing-run policy:    ${EXISTING_RUN_POLICY}"
@@ -184,7 +183,7 @@ for benchmark in "${BENCHMARKS[@]}"; do
       echo
       echo "Running baseline repetitions first..."
 
-      for repetition in "${BASELINE_REPETITIONS[@]}"; do
+      for (( repetition=1; repetition<=BASELINE_REPETITIONS; repetition++ )); do
         "${SCRIPT_DIR}/run_one.sh" \
           "${benchmark}" "${np}" baseline "${repetition}" \
           "${CHECKPOINT_CLEANUP_MODE}"
@@ -194,7 +193,7 @@ for benchmark in "${BENCHMARKS[@]}"; do
       echo "Reusing existing baseline repetitions..."
     fi
 
-    if ! BASELINE_MEAN="$(compute_baseline_mean "${benchmark}" "${np}" "${BASELINE_REPETITIONS[@]}")"; then
+    if ! BASELINE_MEAN="$(compute_baseline_mean "${benchmark}" "${np}" "${BASELINE_REPETITIONS}")"; then
       fail "could not compute a complete baseline mean for ${benchmark^^}.${NPB_CLASS}, ranks=${np}."
     fi
 
@@ -224,10 +223,10 @@ for benchmark in "${BENCHMARKS[@]}"; do
 
       echo
       echo "------------------------------------------------------------"
-      echo "Running CR at ${percentage}% (${TARGET_SECONDS}s), ${#CR_REPETITIONS[@]} configured repetitions"
+      echo "Running CR at ${percentage}% (${TARGET_SECONDS}s), ${CR_REPETITIONS} configured repetitions"
       echo "------------------------------------------------------------"
 
-      for repetition in "${CR_REPETITIONS[@]}"; do
+      for (( repetition=1; repetition<=CR_REPETITIONS; repetition++ )); do
         BASELINE_REFERENCE_SECONDS="${BASELINE_MEAN}" \
           "${SCRIPT_DIR}/run_one.sh" \
             "${benchmark}" "${np}" cr percent "${percentage}" "${repetition}" \

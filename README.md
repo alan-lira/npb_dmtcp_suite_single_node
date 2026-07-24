@@ -305,52 +305,153 @@ Direct-delay run directories use the absolute delay, for example
 
 ### 7. Run the configured experiment matrix
 
-Defaults are defined in `scripts/experiment_config.sh`:
+`scripts/run_all.sh` executes a matrix of baseline and checkpoint/restart
+experiments. The default matrix is defined in
+`scripts/experiment_config.sh`:
 
 ```bash
 BENCHMARKS_TEXT="bt cg"
 MPI_RANKS_TEXT="4"
-BASELINE_REPETITIONS_TEXT="1 2 3"
-CR_REPETITIONS_TEXT="1 2 3"
+BASELINE_REPETITIONS="3"
+CR_REPETITIONS="3"
 CHECKPOINT_PERCENTAGES_TEXT="25 50 75"
 NPB_CLASS="D"
 SOCKET_CLEANUP_SLEEP_SECONDS="10"
 DMTCP_EXPERIMENT_SIGNAL="30"
 ```
 
-Small validation with the default repository-local output path:
+`BASELINE_REPETITIONS` and `CR_REPETITIONS` are counts, not lists of
+repetition identifiers. A value of `1` runs one repetition, a value of `2`
+runs repetitions `1` and `2`, and a value of `3` runs repetitions `1`, `2`,
+and `3`. The repetition number remains part of each run-directory name.
+
+These settings mean that the suite will:
+
+- run both the **BT.D** and **CG.D** benchmarks;
+- use **4 MPI ranks** for each benchmark;
+- execute **3 baseline repetitions** (`rep1` through `rep3`) for each benchmark;
+- calculate a separate mean baseline duration for BT.D and CG.D;
+- request checkpoints at **25%, 50%, and 75%** of the corresponding baseline
+  mean;
+- execute **3 checkpoint/restart repetitions** (`rep1` through `rep3`) for each checkpoint percentage;
+- wait **10 seconds** for operating-system socket cleanup before each restore;
+- use signal **30** as the DMTCP checkpoint signal.
+
+For each benchmark and MPI-rank combination, the suite follows this order:
+
+```text
+1. Run all configured baseline repetitions.
+2. Verify the successful baseline runs.
+3. Calculate their mean duration.
+4. Convert each configured checkpoint percentage into an absolute delay:
+
+   checkpoint delay = baseline mean × checkpoint percentage / 100
+
+5. Run all configured checkpoint/restart repetitions for each percentage.
+6. Record checkpoint, restore, storage, runtime, and overhead metrics.
+```
+
+With the default configuration, the matrix expands to:
+
+```text
+BT.D with 4 MPI ranks:
+  3 baseline runs
+  3 checkpoint percentages × 3 repetitions = 9 checkpoint/restart runs
+  Total: 12 runs
+
+CG.D with 4 MPI ranks:
+  3 baseline runs
+  3 checkpoint percentages × 3 repetitions = 9 checkpoint/restart runs
+  Total: 12 runs
+
+Complete default matrix:
+  6 baseline runs
+  18 checkpoint/restart runs
+  Total: 24 runs
+```
+
+Each checkpoint percentage is calculated from the baseline mean of the same
+benchmark, NPB class, and MPI-rank count. For example, the BT.D baseline mean
+is not used to schedule a CG.D checkpoint.
+
+The configured MPI-rank values must be valid for every selected benchmark:
+
+- BT requires a perfect-square rank count: `1, 4, 9, 16, 25, ...`;
+- CG requires a power-of-two rank count: `1, 2, 4, 8, 16, ...`.
+
+When both `bt` and `cg` are selected, values such as `1`, `4`, and `16` are
+valid for both benchmarks.
+
+#### Small validation
+
+The following command performs a minimal validation using the default
+repository-local output path:
 
 ```bash
 BENCHMARKS_TEXT="bt" \
 MPI_RANKS_TEXT="25" \
-BASELINE_REPETITIONS_TEXT="1" \
-CR_REPETITIONS_TEXT="1" \
+BASELINE_REPETITIONS="1" \
+CR_REPETITIONS="1" \
 CHECKPOINT_PERCENTAGES_TEXT="10" \
 CHECKPOINT_CLEANUP_MODE="keep-checkpoints" \
 ./scripts/run_all.sh
 ```
 
-Small validation with a custom output path:
+This command executes exactly two runs:
+
+```text
+1. One BT.D baseline run with 25 MPI ranks.
+2. One BT.D checkpoint/restart run with the checkpoint requested at 10% of
+   the measured baseline duration.
+```
+
+For example, if the baseline duration is `750` seconds, the checkpoint target
+will be:
+
+```text
+750 × 10 / 100 = 75 seconds after launch
+```
+
+The same validation can be executed with a custom output path:
 
 ```bash
 OUTPUT_ROOT=/scratch/npb-dmtcp-output \
 BENCHMARKS_TEXT="bt" \
 MPI_RANKS_TEXT="25" \
-BASELINE_REPETITIONS_TEXT="1" \
-CR_REPETITIONS_TEXT="1" \
+BASELINE_REPETITIONS="1" \
+CR_REPETITIONS="1" \
 CHECKPOINT_PERCENTAGES_TEXT="10" \
 CHECKPOINT_CLEANUP_MODE="keep-checkpoints" \
 ./scripts/run_all.sh
 ```
 
-Full configured matrix:
+The environment-variable values placed before `./scripts/run_all.sh` override
+the defaults only for that command. They do not modify
+`scripts/experiment_config.sh`.
+
+When the same count should be used for both kinds of execution, the shorthand
+`REPETITIONS` may be used instead:
+
+```bash
+REPETITIONS=2 ./scripts/run_all.sh
+```
+
+This runs baseline repetitions `1` and `2`, followed by checkpoint/restart
+repetitions `1` and `2` for every configured checkpoint percentage.
+
+#### Full configured matrix
+
+Run the complete matrix currently defined in
+`scripts/experiment_config.sh`:
 
 ```bash
 ./scripts/run_all.sh
 ```
 
-The suite runs baseline repetitions first, calculates their mean, and converts
-each checkpoint percentage into an absolute delay.
+The suite always runs the required baseline repetitions before their
+percentage-based checkpoint/restart experiments. A checkpoint/restart run is
+not started when no successful matching baseline duration is available.
+
 
 ### Execution messages
 
