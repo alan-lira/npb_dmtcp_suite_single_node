@@ -273,7 +273,7 @@ fi
 mkdir -p "${RUN_DIR}"
 cd "${RUN_DIR}"
 
-# Exact runtime profile of the successful the proven legacy runner execution.
+# Exact runtime profile of the proven legacy runner execution.
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 export MPIR_CVAR_ENABLE_GPU="${MPIR_CVAR_ENABLE_GPU:-0}"
 export DMTCP_SIGCKPT="${DMTCP_EXPERIMENT_SIGNAL:-30}"
@@ -682,22 +682,52 @@ write_execution_summary() {
     echo "Run directory: ${RUN_DIR}"
     echo
     printf 'Total duration: %.6f seconds\n' "${total}"
-    printf 'Size of checkpoints: %.6f GB total | %.6f GB mean per application rank\n' "${size_total}" "${size_rank}"
-    printf 'Time required for the checkpoint step: %.6f seconds\n' "${checkpoint}"
-    printf 'Time required for the restore step: %.6f seconds\n' "${restore}"
-    printf 'DMTCP checkpoint/restore workflow overhead: %.6f seconds\n' \
-      "${procedure_overhead}"
-    printf '  Included phases: checkpoint %.6f + post-checkpoint stabilization %.6f + original shutdown %.6f + socket cleanup %.6f + restore %.6f seconds\n' \
-      "${checkpoint}" "${stabilization}" "${shutdown}" "${socket_cleanup}" "${restore}"
 
-    if [ "${total_overhead}" = "N/A" ]; then
-      echo "Total DMTCP-related overhead: N/A (no successful baseline was available)"
-      echo "Residual DMTCP runtime difference: N/A (no successful baseline was available)"
+    if [ "${SCENARIO}" = "baseline" ]; then
+      echo "Checkpoint/restore metrics: N/A (baseline execution; not run under DMTCP)"
     else
-      printf 'Total DMTCP-related overhead: %.6f seconds (%.3f%% compared with baseline mean %.6f seconds)\n' \
-        "${total_overhead}" "${total_overhead_pct}" "${baseline}"
+      printf 'Size of checkpoints: %.6f GB total | %.6f GB mean per application rank\n' "${size_total}" "${size_rank}"
+      printf 'Time required for the checkpoint step: %.6f seconds\n' "${checkpoint}"
+      printf 'Time required for the restore step: %.6f seconds\n' "${restore}"
+      printf 'DMTCP checkpoint/restore workflow overhead: %.6f seconds\n' \
+        "${procedure_overhead}"
+      printf '  Included phases: checkpoint %.6f + post-checkpoint stabilization %.6f + original shutdown %.6f + socket cleanup %.6f + restore %.6f seconds\n' \
+        "${checkpoint}" "${stabilization}" "${shutdown}" "${socket_cleanup}" "${restore}"
 
-      python3 - "${residual_difference}" <<'PY'
+      if [ "${total_overhead}" = "N/A" ]; then
+        echo "Total DMTCP-related overhead: N/A (no successful baseline was available)"
+        echo "Residual DMTCP runtime difference: N/A (no successful baseline was available)"
+      else
+        python3 - "${total_overhead}" "${total_overhead_pct}" "${baseline}" <<'PY'
+import sys
+
+value = float(sys.argv[1])
+percent = float(sys.argv[2])
+baseline = float(sys.argv[3])
+magnitude = abs(value)
+epsilon = 0.5e-6
+
+if value < -epsilon:
+    interpretation = (
+        f"complete DMTCP execution was {magnitude:.6f} seconds faster "
+        "than the baseline"
+    )
+elif value > epsilon:
+    interpretation = (
+        f"complete DMTCP execution was {magnitude:.6f} seconds slower "
+        "than the baseline"
+    )
+else:
+    interpretation = "no measurable total difference from the baseline"
+
+print(
+    f"Total DMTCP-related overhead: {value:.6f} seconds "
+    f"({percent:.3f}% compared with baseline mean {baseline:.6f} seconds; "
+    f"{interpretation})"
+)
+PY
+
+        python3 - "${residual_difference}" <<'PY'
 import sys
 
 value = float(sys.argv[1])
@@ -723,6 +753,7 @@ else:
         "checkpoint/restore workflow)"
     )
 PY
+      fi
     fi
   } > execution_summary.txt
 }
@@ -783,7 +814,7 @@ write_zero_cr_metrics() {
   echo "MPICH device: ${MPICH_DEVICE:-unknown}"
   echo "MPICH_NO_LOCAL: ${MPICH_NO_LOCAL:-}"
   echo "MPIR_CVAR_ENABLE_GPU: ${MPIR_CVAR_ENABLE_GPU:-}"
-  echo "Successful workflow: fresh coordinator, --exit-on-last, 10-second socket cleanup, generated restart script without extra arguments"
+  echo "Successful workflow: fresh coordinator, --exit-on-last, ${SOCKET_CLEANUP_SLEEP_SECONDS}-second socket cleanup, generated restart script without extra arguments"
 } > run_metadata.txt
 
 printf '%s\n' "${CHECKPOINT_MODE}" > checkpoint_mode.txt
@@ -864,7 +895,7 @@ if [ "${SCENARIO}" = "baseline" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Checkpoint/restart execution: preserve the successful the proven legacy runner order.
+# Checkpoint/restart execution: preserve the proven legacy runner order.
 # ---------------------------------------------------------------------------
 PORT="${DMTCP_COORD_PORT:-$(select_random_port)}"
 echo "${PORT}" > dmtcp_coord_port.txt
@@ -1018,7 +1049,7 @@ phase restore "Restoring checkpoints using script: ${RESTART_SCRIPT_ABS}"
 phase restore "The generated script will launch a new coordinator and restore ${EXPECTED_DMTCP_CLIENTS} DMTCP clients."
 
 # Do not pass coordinator options here.  This is intentionally identical to
-# the successful the proven legacy runner behavior.
+# the proven legacy runner behavior.
 bash "${RESTART_SCRIPT}" \
   > stdout_after_restore.log 2> stderr_after_restore.log &
 RESTORED_PID=$!

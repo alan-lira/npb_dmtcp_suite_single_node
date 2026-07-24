@@ -451,7 +451,7 @@ export LD_LIBRARY_PATH="\${MPICH_HOME}/lib"
 
 # Runtime settings from the preserved successful single-node profile.
 export MPICH_NO_LOCAL=1
-export DMTCP_SIGCKPT="\${DMTCP_SIGCKPT:-24}"
+export DMTCP_SIGCKPT="\${DMTCP_SIGCKPT:-30}"
 
 # The working MPICH embedded hwloc was compiled without libudev and did not use
 # a HWLOC_COMPONENTS override. Clear values inherited from the previously

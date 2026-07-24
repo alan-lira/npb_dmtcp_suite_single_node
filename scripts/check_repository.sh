@@ -1,4 +1,10 @@
 #!/usr/bin/env bash
+
+# Copyright 2026 Alan Lira Nunes
+# SPDX-License-Identifier: Apache-2.0
+# Licensed under the Apache License, Version 2.0.
+# See the LICENSE file in the repository root for details.
+
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"

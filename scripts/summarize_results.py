@@ -291,6 +291,33 @@ def parse_run_directory(run_dir: Path) -> Optional[Dict[str, object]]:
     if residual_difference is None and total_overhead is not None and workflow_overhead is not None:
         residual_difference = total_overhead - workflow_overhead
 
+    checkpoint_size_gb = read_number(run_dir, ("checkpoint_size_gb.txt",))
+    checkpoint_size_gib = read_number(run_dir, ("checkpoint_size_gib.txt",))
+    checkpoint_mean_per_rank_gb = read_number(
+        run_dir, ("checkpoint_mean_per_rank_gb.txt",)
+    )
+    checkpoint_mean_per_rank_gib = read_number(
+        run_dir, ("checkpoint_mean_per_rank_gib.txt",)
+    )
+
+    # Baseline runs are not launched under DMTCP.  Older result directories may
+    # contain zero-valued compatibility files for checkpoint/restore metrics;
+    # expose those fields as N/A instead of presenting the zeros as measurements.
+    if scenario == "baseline":
+        checkpoint_seconds = None
+        stabilization_seconds = None
+        shutdown_seconds = None
+        socket_cleanup_seconds = None
+        restore_seconds = None
+        workflow_overhead = None
+        total_overhead = None
+        total_overhead_percent = None
+        residual_difference = None
+        checkpoint_size_gb = None
+        checkpoint_size_gib = None
+        checkpoint_mean_per_rank_gb = None
+        checkpoint_mean_per_rank_gib = None
+
     row: Dict[str, object] = {
         "run_name": run_dir.name,
         "run_directory": str(run_dir.resolve()),
@@ -315,14 +342,10 @@ def parse_run_directory(run_dir: Path) -> Optional[Dict[str, object]]:
         "total_dmtcp_related_direction": signed_direction(total_overhead),
         "residual_dmtcp_runtime_difference_seconds": residual_difference,
         "residual_dmtcp_runtime_direction": residual_direction(residual_difference),
-        "checkpoint_size_gb": read_number(run_dir, ("checkpoint_size_gb.txt",)),
-        "checkpoint_size_gib": read_number(run_dir, ("checkpoint_size_gib.txt",)),
-        "checkpoint_mean_per_rank_gb": read_number(
-            run_dir, ("checkpoint_mean_per_rank_gb.txt",)
-        ),
-        "checkpoint_mean_per_rank_gib": read_number(
-            run_dir, ("checkpoint_mean_per_rank_gib.txt",)
-        ),
+        "checkpoint_size_gb": checkpoint_size_gb,
+        "checkpoint_size_gib": checkpoint_size_gib,
+        "checkpoint_mean_per_rank_gb": checkpoint_mean_per_rank_gb,
+        "checkpoint_mean_per_rank_gib": checkpoint_mean_per_rank_gib,
     }
     return row
 
@@ -440,11 +463,13 @@ def print_console_summary(
         if baseline is None:
             print("Baseline: unavailable")
         else:
+            repetitions = int(baseline["successful_repetitions"])
+            repetition_label = "repetition" if repetitions == 1 else "repetitions"
             print(
                 "Baseline: "
                 f"{format_value(baseline['total_seconds_mean'])} ± "
                 f"{format_value(baseline['total_seconds_std'])} s "
-                f"({baseline['successful_repetitions']} successful repetitions)"
+                f"({repetitions} successful {repetition_label})"
             )
 
         cr_rows = [row for row in matching if row["scenario"] == "cr"]

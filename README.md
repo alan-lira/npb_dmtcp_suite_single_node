@@ -62,6 +62,10 @@ The installer writes the environment helper to:
 ~/opt/enable_dmtcp_mpich_env.sh
 ```
 
+The generated helper and the experiment configuration both default to DMTCP
+checkpoint signal `30`. Individual experiment commands may override it with
+`DMTCP_EXPERIMENT_SIGNAL=<signal>`.
+
 The default build and installation locations can be changed:
 
 ```bash
@@ -470,6 +474,7 @@ A checkpoint/restart execution reports each phase explicitly:
 [restore] Progress: 27/27 clients RUNNING.
 [restore] Restore complete; step took ... seconds.
 [run] Restored application is still running...
+[run] Still running; elapsed since latest restore: ... | since initial launch: ...
 [complete] NPB verification was SUCCESSFUL.
 ```
 
@@ -486,8 +491,16 @@ Time required for the checkpoint step: X seconds
 Time required for the restore step: X seconds
 DMTCP checkpoint/restore workflow overhead: X seconds
   Included phases: checkpoint X + post-checkpoint stabilization X + original shutdown X + socket cleanup X + restore X seconds
-Total DMTCP-related overhead: X seconds (... compared with baseline mean ...)
-Residual DMTCP runtime difference: X seconds (... faster/slower than the baseline ...)
+Total DMTCP-related overhead: X seconds (... compared with baseline mean ...; complete DMTCP execution was X seconds faster/slower than the baseline)
+Residual DMTCP runtime difference: X seconds (execution outside the checkpoint/restore workflow was X seconds faster/slower than the baseline)
+```
+
+A baseline execution reports only its total duration and explicitly marks the
+DMTCP-specific measurements as unavailable:
+
+```text
+Total duration: X seconds
+Checkpoint/restore metrics: N/A (baseline execution; not run under DMTCP)
 ```
 
 Definitions:
@@ -551,6 +564,11 @@ A direct checkpoint/restart run without a matching successful baseline still
 records the DMTCP checkpoint/restore workflow overhead. The total DMTCP-related
 overhead and residual DMTCP runtime difference are recorded as `N/A` because
 they require a baseline reference.
+
+Baseline result directories retain zero-valued compatibility files for older
+analysis tools, but `execution_summary.txt`, `per_run_results.csv`, and
+`aggregate_results.csv` expose DMTCP-specific baseline metrics as `N/A`, since
+the baseline application is not launched under DMTCP.
 
 ### Summaries
 
