@@ -142,8 +142,6 @@ dmypy.json
 *.env
 env/*
 
-binaries/
-results/
 *.pyc
 
 # Repository-local generated artifacts

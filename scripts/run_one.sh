@@ -14,19 +14,19 @@ source "${SCRIPT_DIR}/experiment_config.sh"
 usage() {
   cat <<USAGE
 Usage:
-  $0 <bt|cg> <mpi-ranks> <baseline|cr> <checkpoint-delay-seconds> <rep> [delete-checkpoints|keep-checkpoints]
+  $0 <bt|cg> <mpi-ranks> baseline <rep> [delete-checkpoints|keep-checkpoints]
+  $0 <bt|cg> <mpi-ranks> cr percent <checkpoint-percent> <rep> [delete-checkpoints|keep-checkpoints]
+  $0 <bt|cg> <mpi-ranks> cr delay <checkpoint-delay-seconds> <rep> [delete-checkpoints|keep-checkpoints]
 
-Compatibility syntax used by existing suite callers:
-  $0 <bt|cg> <mpi-ranks> <baseline|cr> <checkpoint-percent> <checkpoint-delay-seconds> <rep> [delete-checkpoints|keep-checkpoints]
-
-Legacy syntax:
-  $0 <mpi-ranks> <baseline|cr> <checkpoint-delay-seconds> <rep> [bt|cg] [delete-checkpoints|keep-checkpoints]
+Percentage mode requires either successful matching baseline runs under
+RESULTS_ROOT or an explicit BASELINE_REFERENCE_SECONDS value.
 
 Examples:
-  $0 bt 25 baseline 0 1 keep-checkpoints
-  $0 bt 25 cr 60 1 keep-checkpoints
-  $0 25 cr 60 1
-  $0 8 cr 60 1 cg keep-checkpoints
+  $0 bt 25 baseline 1 keep-checkpoints
+  $0 bt 25 cr percent 10 1 keep-checkpoints
+  BASELINE_REFERENCE_SECONDS=1373.779475573 $0 bt 25 cr percent 10 1 keep-checkpoints
+  $0 bt 25 cr delay 60 1 keep-checkpoints
+  $0 cg 8 cr delay 60 1 keep-checkpoints
 USAGE
 }
 
@@ -49,113 +49,99 @@ is_nonnegative_number() {
   [[ "$1" =~ ^[0-9]+([.][0-9]+)?$ ]]
 }
 
+resolve_percentage_baseline() {
+  if [[ "${BASELINE_REFERENCE_SECONDS:-}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    python3 - "${BASELINE_REFERENCE_SECONDS}" <<'PY'
+import sys
+value = float(sys.argv[1])
+if value <= 0:
+    raise SystemExit(1)
+print(f'{value:.9f}')
+PY
+    return
+  fi
+
+  python3 - "${RESULTS_ROOT}" "${BENCHMARK}" "${NPB_CLASS}" "${NP}" <<'PY'
+from pathlib import Path
+import statistics
+import sys
+
+root = Path(sys.argv[1])
+benchmark, npb_class, np = sys.argv[2], sys.argv[3], int(sys.argv[4])
+patterns = (
+    f'{benchmark}{npb_class}_np{np}_baseline_rep*',
+    f'{benchmark}{npb_class}_np{np}_baseline_t*_rep*',
+)
+values = []
+seen = set()
+for pattern in patterns:
+    for run_dir in root.glob(pattern):
+        if run_dir in seen or not run_dir.is_dir():
+            continue
+        seen.add(run_dir)
+        status = run_dir / 'run_status.txt'
+        total = run_dir / 'total_seconds.txt'
+        if status.exists() and status.read_text().strip() == 'SUCCESS' and total.exists():
+            value = float(total.read_text().strip())
+            if value > 0:
+                values.append(value)
+if not values:
+    raise SystemExit(1)
+print(f'{statistics.mean(values):.9f}')
+PY
+}
+
 # ---------------------------------------------------------------------------
-# Accept the primary direct interface, the existing suite-caller interface,
-# and the original four-argument interface. The execution engine below is
-# shared by all modes.
+# Checkpoint targeting modes are mutually exclusive:
+#   percent -> derive the delay from a baseline duration;
+#   delay   -> use the supplied absolute delay directly.
 # ---------------------------------------------------------------------------
-INVOCATION_MODE="direct"
-CHECKPOINT_PERCENT="${CHECKPOINT_PERCENTAGE_LABEL:-0}"
+CHECKPOINT_MODE="none"
+CHECKPOINT_PERCENT="N/A"
+CHECKPOINT_BASELINE_SECONDS="N/A"
+CHECKPOINT_DELAY_SECONDS="0"
 CHECKPOINT_LABEL=""
 CHECKPOINT_CLEANUP_MODE_ARG=""
 
-if [ "$#" -ge 1 ] && [[ "${1,,}" =~ ^(bt|cg)$ ]]; then
-  if [ "$#" -lt 3 ]; then
-    usage
-    exit 1
-  fi
+if [ "$#" -lt 4 ] || ! [[ "${1,,}" =~ ^(bt|cg)$ ]]; then
+  usage
+  exit 1
+fi
 
-  BENCHMARK="${1,,}"
-  NP="$2"
-  SCENARIO="${3,,}"
+BENCHMARK="${1,,}"
+NP="$2"
+SCENARIO="${3,,}"
 
-  case "$#" in
-    5)
-      CHECKPOINT_DELAY_SECONDS="$4"
-      REP="$5"
-      ;;
-    6)
-      case "${6,,}" in
-        delete-checkpoints|keep-checkpoints)
-          CHECKPOINT_DELAY_SECONDS="$4"
-          REP="$5"
-          CHECKPOINT_CLEANUP_MODE_ARG="${6,,}"
-          ;;
-        *)
-          is_positive_integer "$6" || {
-            usage
-            exit 1
-          }
-          INVOCATION_MODE="suite-compat"
-          CHECKPOINT_PERCENT="$4"
-          CHECKPOINT_DELAY_SECONDS="$5"
-          REP="$6"
-          ;;
-      esac
-      ;;
-    7)
-      INVOCATION_MODE="suite-compat"
-      CHECKPOINT_PERCENT="$4"
-      CHECKPOINT_DELAY_SECONDS="$5"
-      REP="$6"
-      CHECKPOINT_CLEANUP_MODE_ARG="${7,,}"
-      ;;
-    *)
+case "${SCENARIO}" in
+  baseline)
+    if [ "$#" -lt 4 ] || [ "$#" -gt 5 ]; then
       usage
       exit 1
-      ;;
-  esac
-else
-  INVOCATION_MODE="legacy"
-  if [ "$#" -lt 4 ] || [ "$#" -gt 6 ]; then
-    usage
-    exit 1
-  fi
-
-  NP="$1"
-  SCENARIO="${2,,}"
-  CHECKPOINT_DELAY_SECONDS="$3"
-  REP="$4"
-  BENCHMARK="bt"
-  CHECKPOINT_CLEANUP_MODE_ARG=""
-
-  if [ "$#" -ge 5 ]; then
-    case "${5,,}" in
-      bt|cg)
-        BENCHMARK="${5,,}"
-        CHECKPOINT_CLEANUP_MODE_ARG="${6:-}"
-        ;;
-      delete-checkpoints|keep-checkpoints)
-        CHECKPOINT_CLEANUP_MODE_ARG="${5,,}"
-        [ "$#" -eq 5 ] || fail "a sixth legacy argument is valid only when the fifth argument is bt or cg."
-        ;;
-      *)
-        fail "legacy fifth argument must be bt, cg, delete-checkpoints, or keep-checkpoints."
-        ;;
-    esac
-  fi
-fi
+    fi
+    REP="$4"
+    CHECKPOINT_CLEANUP_MODE_ARG="${5:-}"
+    ;;
+  cr)
+    if [ "$#" -lt 6 ] || [ "$#" -gt 7 ]; then
+      usage
+      exit 1
+    fi
+    CHECKPOINT_MODE="${4,,}"
+    CHECKPOINT_TARGET_VALUE="$5"
+    REP="$6"
+    CHECKPOINT_CLEANUP_MODE_ARG="${7:-}"
+    ;;
+  *)
+    fail "scenario must be baseline or cr; received '${SCENARIO}'."
+    ;;
+esac
 
 if [ -n "${CHECKPOINT_CLEANUP_MODE_ARG}" ]; then
   CHECKPOINT_CLEANUP_MODE="${CHECKPOINT_CLEANUP_MODE_ARG}"
 fi
 
-case "${BENCHMARK}" in
-  bt|cg) ;;
-  *) fail "benchmark must be bt or cg; received '${BENCHMARK}'." ;;
-esac
-
-case "${SCENARIO}" in
-  baseline|cr) ;;
-  *) fail "scenario must be baseline or cr; received '${SCENARIO}'." ;;
-esac
-
 is_positive_integer "${NP}" || fail "MPI rank count must be a positive integer."
 is_positive_integer "${REP}" || fail "repetition number must be a positive integer."
-is_nonnegative_number "${CHECKPOINT_DELAY_SECONDS}" || fail "checkpoint delay must be a nonnegative number."
-
-[[ "${CHECKPOINT_PERCENT}" =~ ^[0-9]+$ ]] \
-  || fail "checkpoint percentage label must be a nonnegative integer."
 
 case "${CHECKPOINT_CLEANUP_MODE}" in
   delete-checkpoints|keep-checkpoints) ;;
@@ -167,22 +153,30 @@ case "${EXISTING_RUN_POLICY}" in
   *) fail "EXISTING_RUN_POLICY must be replace, skip, or error." ;;
 esac
 
-if [ "${SCENARIO}" = "baseline" ]; then
-  [ "${CHECKPOINT_DELAY_SECONDS}" = "0" ] \
-    || fail "baseline runs require checkpoint delay 0."
-  [ "${CHECKPOINT_PERCENT}" = "0" ] \
-    || fail "baseline runs require checkpoint percentage label 0."
-else
-  python3 - "${CHECKPOINT_DELAY_SECONDS}" <<'PY' \
-    || fail "CR runs require a checkpoint delay greater than zero."
+if [ "${SCENARIO}" = "cr" ]; then
+  case "${CHECKPOINT_MODE}" in
+    percent)
+      [[ "${CHECKPOINT_TARGET_VALUE}" =~ ^[0-9]+$ ]] \
+        || fail "checkpoint percentage must be an integer between 1 and 99."
+      if [ "${CHECKPOINT_TARGET_VALUE}" -le 0 ] || [ "${CHECKPOINT_TARGET_VALUE}" -ge 100 ]; then
+        fail "checkpoint percentage must be between 1 and 99."
+      fi
+      CHECKPOINT_PERCENT="${CHECKPOINT_TARGET_VALUE}"
+      ;;
+    delay)
+      is_nonnegative_number "${CHECKPOINT_TARGET_VALUE}" \
+        || fail "checkpoint delay must be a nonnegative number."
+      python3 - "${CHECKPOINT_TARGET_VALUE}" <<'PY' \
+        || fail "checkpoint delay must be greater than zero."
 import sys
 raise SystemExit(0 if float(sys.argv[1]) > 0 else 1)
 PY
-
-  if [ "${CHECKPOINT_PERCENT}" != "0" ] && \
-     { [ "${CHECKPOINT_PERCENT}" -le 0 ] || [ "${CHECKPOINT_PERCENT}" -ge 100 ]; }; then
-    fail "CR checkpoint percentage label must be between 1 and 99."
-  fi
+      CHECKPOINT_DELAY_SECONDS="${CHECKPOINT_TARGET_VALUE}"
+      ;;
+    *)
+      fail "CR checkpoint mode must be percent or delay; received '${CHECKPOINT_MODE}'."
+      ;;
+  esac
 fi
 
 if [ "${BENCHMARK}" = "bt" ]; then
@@ -224,23 +218,31 @@ NPB_BIN="${BINARY_ROOT}/${BENCHMARK}.${NPB_CLASS}.x"
 [ -x "${NPB_BIN}" ] \
   || fail "missing benchmark binary: ${NPB_BIN}; run build_npb_bt_cg_d.sh first."
 
-if [ "${INVOCATION_MODE}" = "legacy" ]; then
-  CHECKPOINT_LABEL="$(python3 - "${CHECKPOINT_DELAY_SECONDS}" <<'PY'
+if [ "${SCENARIO}" = "cr" ] && [ "${CHECKPOINT_MODE}" = "percent" ]; then
+  BASELINE_REFERENCE_SECONDS="$(resolve_percentage_baseline 2>/dev/null || true)"
+  if [ -z "${BASELINE_REFERENCE_SECONDS}" ]; then
+    fail "percentage mode requires successful matching baseline runs under ${RESULTS_ROOT} or BASELINE_REFERENCE_SECONDS=<seconds>."
+  fi
+
+  CHECKPOINT_BASELINE_SECONDS="${BASELINE_REFERENCE_SECONDS}"
+  export BASELINE_REFERENCE_SECONDS
+  CHECKPOINT_DELAY_SECONDS="$(python3 - "${CHECKPOINT_BASELINE_SECONDS}" "${CHECKPOINT_PERCENT}" <<'PY'
 import sys
-value = sys.argv[1]
-print(value.replace('.', 'p'))
+baseline = float(sys.argv[1])
+percentage = int(sys.argv[2])
+print(f'{baseline * percentage / 100.0:.9f}')
 PY
 )"
-  RUN_NAME="${BENCHMARK}${NPB_CLASS}_np${NP}_${SCENARIO}_t${CHECKPOINT_LABEL}_rep${REP}"
-elif [ "${SCENARIO}" = "baseline" ]; then
+fi
+
+if [ "${SCENARIO}" = "baseline" ]; then
   RUN_NAME="${BENCHMARK}${NPB_CLASS}_np${NP}_baseline_rep${REP}"
-elif [ "${CHECKPOINT_PERCENT}" != "0" ]; then
+elif [ "${CHECKPOINT_MODE}" = "percent" ]; then
   RUN_NAME="${BENCHMARK}${NPB_CLASS}_np${NP}_cr_p${CHECKPOINT_PERCENT}_rep${REP}"
 else
   CHECKPOINT_LABEL="$(python3 - "${CHECKPOINT_DELAY_SECONDS}" <<'PY'
 import sys
-value = sys.argv[1]
-print(value.replace('.', 'p'))
+print(sys.argv[1].replace('.', 'p'))
 PY
 )"
   RUN_NAME="${BENCHMARK}${NPB_CLASS}_np${NP}_cr_t${CHECKPOINT_LABEL}_rep${REP}"
@@ -656,13 +658,14 @@ write_zero_cr_metrics() {
 {
   echo "Run name: ${RUN_NAME}"
   echo "Start timestamp: $(date -Is)"
-  echo "Invocation mode: ${INVOCATION_MODE}"
   echo "Benchmark: ${BENCHMARK}"
   echo "NPB class: ${NPB_CLASS}"
   echo "MPI ranks: ${NP}"
   echo "Scenario: ${SCENARIO}"
   echo "Repetition: ${REP}"
-  echo "Checkpoint percentage label: ${CHECKPOINT_PERCENT}"
+  echo "Checkpoint mode: ${CHECKPOINT_MODE}"
+  echo "Checkpoint percentage: ${CHECKPOINT_PERCENT}"
+  echo "Checkpoint baseline seconds: ${CHECKPOINT_BASELINE_SECONDS}"
   echo "Checkpoint target seconds: ${CHECKPOINT_DELAY_SECONDS}"
   echo "Output root: ${OUTPUT_ROOT}"
   echo "Results root: ${RESULTS_ROOT}"
@@ -677,7 +680,9 @@ write_zero_cr_metrics() {
   echo "Successful workflow: fresh coordinator, --exit-on-last, 10-second socket cleanup, generated restart script without extra arguments"
 } > run_metadata.txt
 
+printf '%s\n' "${CHECKPOINT_MODE}" > checkpoint_mode.txt
 printf '%s\n' "${CHECKPOINT_PERCENT}" > checkpoint_percentage.txt
+printf '%s\n' "${CHECKPOINT_BASELINE_SECONDS}" > checkpoint_baseline_seconds.txt
 printf '%s\n' "${CHECKPOINT_DELAY_SECONDS}" > checkpoint_target_seconds.txt
 printf '%s\n' "${DMTCP_SIGCKPT}" > dmtcp_signal.txt
 printf '%s\n' "fresh" > coordinator_lifecycle.txt
@@ -689,10 +694,10 @@ printf '%s\n' "============================================================"
 printf '%s\n' "${BENCHMARK^^}.${NPB_CLASS} | MPI ranks=${NP} | scenario=${SCENARIO} | repetition=${REP}"
 printf '%s\n' "Output directory: ${RUN_DIR}"
 if [ "${SCENARIO}" = "cr" ]; then
-  if [ "${CHECKPOINT_PERCENT}" != "0" ]; then
-    printf '%s\n' "Checkpoint target: ${CHECKPOINT_PERCENT}% (${CHECKPOINT_DELAY_SECONDS} seconds after launch)"
+  if [ "${CHECKPOINT_MODE}" = "percent" ]; then
+    printf '%s\n' "Checkpoint target: ${CHECKPOINT_PERCENT}% of baseline ${CHECKPOINT_BASELINE_SECONDS}s = ${CHECKPOINT_DELAY_SECONDS}s after launch"
   else
-    printf '%s\n' "Checkpoint target: ${CHECKPOINT_DELAY_SECONDS} seconds after launch"
+    printf '%s\n' "Checkpoint target: ${CHECKPOINT_DELAY_SECONDS} seconds after launch (direct delay)"
   fi
   printf '%s\n' "Checkpoint cleanup: ${CHECKPOINT_CLEANUP_MODE}"
 fi

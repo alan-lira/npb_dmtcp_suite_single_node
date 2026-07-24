@@ -1,10 +1,4 @@
 #!/usr/bin/env bash
-
-# Copyright 2026 Alan Lira Nunes
-# SPDX-License-Identifier: Apache-2.0
-# Licensed under the Apache License, Version 2.0.
-# See the LICENSE file in the repository root for details.
-
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -20,6 +14,21 @@ for script in "${SCRIPT_DIR}"/*.sh; do
   fi
 
 done
+
+# bash -n does not evaluate parameter expansions, so source the shared
+# configuration once to catch runtime errors such as an invalid ${...}
+# substitution before any build or experiment is started.
+if (
+  set -euo pipefail
+  # shellcheck disable=SC1090
+  source "${SCRIPT_DIR}/experiment_config.sh"
+  : "${REPO_ROOT}" "${OUTPUT_ROOT}" "${BINARY_ROOT}" "${RESULTS_ROOT}"
+); then
+  printf '[OK] runtime load: scripts/experiment_config.sh\n'
+else
+  printf '[ERROR] runtime load failed: scripts/experiment_config.sh\n' >&2
+  failed=1
+fi
 
 if python3 -m py_compile "${SCRIPT_DIR}/summarize_results.py"; then
   printf '[OK] Python syntax: scripts/summarize_results.py\n'

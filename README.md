@@ -263,10 +263,8 @@ OUTPUT_ROOT=/scratch/npb-dmtcp-output \
 ./scripts/run_one.sh bt 25 cr delay 60 1 keep-checkpoints
 ```
 
-The `percent` and `delay` modes cannot be combined.
-
-Percentage-mode run directories use the percentage, for example `btD_np25_cr_p10_rep1`.
-
+The `percent` and `delay` modes cannot be combined. Percentage-mode run
+directories use the percentage, for example `btD_np25_cr_p10_rep1`.
 Direct-delay run directories use the absolute delay, for example
 `btD_np25_cr_t60_rep1`.
 
