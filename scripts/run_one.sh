@@ -633,37 +633,45 @@ procedure_overhead = sum(
     )
 )
 
-Path('checkpoint_restore_procedure_overhead_seconds.txt').write_text(
-    f'{procedure_overhead:.9f}\n'
-)
+workflow_text = f'{procedure_overhead:.9f}\n'
+Path('checkpoint_restore_workflow_overhead_seconds.txt').write_text(workflow_text)
+# Backward-compatible alias for the previous metric name.
+Path('checkpoint_restore_procedure_overhead_seconds.txt').write_text(workflow_text)
 
 total_text = Path('total_dmtcp_related_overhead_seconds.txt').read_text().strip()
 
 if total_text == 'N/A':
-    Path('residual_dmtcp_runtime_overhead_seconds.txt').write_text('N/A\n')
+    residual_text = 'N/A\n'
 else:
     total_overhead = float(total_text)
-    residual_overhead = total_overhead - procedure_overhead
-    Path('residual_dmtcp_runtime_overhead_seconds.txt').write_text(
-        f'{residual_overhead:.9f}\n'
-    )
+    residual_difference = total_overhead - procedure_overhead
+    residual_text = f'{residual_difference:.9f}\n'
+
+# The new name reflects that this is a signed difference.  Keep the previous
+# file as a backward-compatible alias for existing analysis scripts.
+Path('residual_dmtcp_runtime_difference_seconds.txt').write_text(residual_text)
+Path('residual_dmtcp_runtime_overhead_seconds.txt').write_text(residual_text)
 PY
 }
 
 write_execution_summary() {
-  local total checkpoint restore size_total size_rank baseline
-  local procedure_overhead total_overhead total_overhead_pct residual_overhead
+  local total checkpoint restore stabilization shutdown socket_cleanup
+  local size_total size_rank baseline procedure_overhead
+  local total_overhead total_overhead_pct residual_difference
 
   total="$(<total_seconds.txt)"
   checkpoint="$(<checkpoint_seconds.txt)"
   restore="$(<dmtcp_restore_seconds.txt)"
+  stabilization="$(<post_checkpoint_stabilization_seconds.txt)"
+  shutdown="$(<original_shutdown_seconds.txt)"
+  socket_cleanup="$(<socket_cleanup_sleep_seconds.txt)"
   size_total="$(<checkpoint_size_gb.txt)"
   size_rank="$(<checkpoint_mean_per_rank_gb.txt)"
   baseline="$(<baseline_reference_seconds.txt)"
-  procedure_overhead="$(<checkpoint_restore_procedure_overhead_seconds.txt)"
+  procedure_overhead="$(<checkpoint_restore_workflow_overhead_seconds.txt)"
   total_overhead="$(<total_dmtcp_related_overhead_seconds.txt)"
   total_overhead_pct="$(<total_dmtcp_related_overhead_percent.txt)"
-  residual_overhead="$(<residual_dmtcp_runtime_overhead_seconds.txt)"
+  residual_difference="$(<residual_dmtcp_runtime_difference_seconds.txt)"
 
   {
     echo "Execution summary"
@@ -677,17 +685,44 @@ write_execution_summary() {
     printf 'Size of checkpoints: %.6f GB total | %.6f GB mean per application rank\n' "${size_total}" "${size_rank}"
     printf 'Time required for the checkpoint step: %.6f seconds\n' "${checkpoint}"
     printf 'Time required for the restore step: %.6f seconds\n' "${restore}"
-    printf 'DMTCP checkpoint/restore procedure overhead: %.6f seconds\n' \
+    printf 'DMTCP checkpoint/restore workflow overhead: %.6f seconds\n' \
       "${procedure_overhead}"
+    printf '  Included phases: checkpoint %.6f + post-checkpoint stabilization %.6f + original shutdown %.6f + socket cleanup %.6f + restore %.6f seconds\n' \
+      "${checkpoint}" "${stabilization}" "${shutdown}" "${socket_cleanup}" "${restore}"
 
     if [ "${total_overhead}" = "N/A" ]; then
       echo "Total DMTCP-related overhead: N/A (no successful baseline was available)"
-      echo "Residual DMTCP runtime overhead: N/A (no successful baseline was available)"
+      echo "Residual DMTCP runtime difference: N/A (no successful baseline was available)"
     else
       printf 'Total DMTCP-related overhead: %.6f seconds (%.3f%% compared with baseline mean %.6f seconds)\n' \
         "${total_overhead}" "${total_overhead_pct}" "${baseline}"
-      printf 'Residual DMTCP runtime overhead: %.6f seconds\n' \
-        "${residual_overhead}"
+
+      python3 - "${residual_difference}" <<'PY'
+import sys
+
+value = float(sys.argv[1])
+magnitude = abs(value)
+epsilon = 0.5e-6
+
+if value < -epsilon:
+    print(
+        f"Residual DMTCP runtime difference: {value:.6f} seconds "
+        f"(execution outside the checkpoint/restore workflow was "
+        f"{magnitude:.6f} seconds faster than the baseline)"
+    )
+elif value > epsilon:
+    print(
+        f"Residual DMTCP runtime difference: {value:.6f} seconds "
+        f"(execution outside the checkpoint/restore workflow was "
+        f"{magnitude:.6f} seconds slower than the baseline)"
+    )
+else:
+    print(
+        "Residual DMTCP runtime difference: 0.000000 seconds "
+        "(no measurable difference from the baseline outside the "
+        "checkpoint/restore workflow)"
+    )
+PY
     fi
   } > execution_summary.txt
 }

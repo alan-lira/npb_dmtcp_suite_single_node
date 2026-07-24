@@ -475,35 +475,48 @@ A checkpoint/restart execution reports each phase explicitly:
 
 ### Measurements
 
-Every successful run contains `execution_summary.txt`:
+Every successful run contains `execution_summary.txt`. For a
+checkpoint/restart execution with a matching baseline, the summary has the
+following form:
 
 ```text
 Total duration: X seconds
 Size of checkpoints: Y1 GB total | Y2 GB mean per application rank
 Time required for the checkpoint step: X seconds
 Time required for the restore step: X seconds
-DMTCP checkpoint/restore procedure overhead: X seconds
+DMTCP checkpoint/restore workflow overhead: X seconds
+  Included phases: checkpoint X + post-checkpoint stabilization X + original shutdown X + socket cleanup X + restore X seconds
 Total DMTCP-related overhead: X seconds (... compared with baseline mean ...)
-Residual DMTCP runtime overhead: X seconds
+Residual DMTCP runtime difference: X seconds (... faster/slower than the baseline ...)
 ```
 
 Definitions:
 
 - **Total duration:** original launch through completion of the restored run;
-- **Checkpoint time:** checkpoint request through visibility of all images and
-  the restart script;
+- **Checkpoint time:** checkpoint request through visibility of all checkpoint
+  images and the generated restart script;
 - **Restore time:** restart-script launch until all expected DMTCP clients are
   confirmed as `RUNNING`;
 - **Checkpoint total size:** all top-level `ckpt_*` files and associated
   `ckpt_*` directories;
-- **Mean per rank:** checkpoint total size divided by application MPI ranks;
-- **DMTCP checkpoint/restore procedure overhead:** sum of the checkpoint step,
+- **Mean per rank:** checkpoint total size divided by the number of application
+  MPI ranks;
+- **DMTCP checkpoint/restore workflow overhead:** sum of the checkpoint step,
   post-checkpoint stabilization, original-computation shutdown, socket-cleanup
-  delay, and restore step;
+  delay, and restore step. The execution summary prints all five components so
+  this value is not confused with checkpoint time plus restore time alone;
 - **Total DMTCP-related overhead:** checkpoint/restart total duration minus the
-  mean of successful matching baseline runs;
-- **Residual DMTCP runtime overhead:** total DMTCP-related overhead minus the
-  DMTCP checkpoint/restore procedure overhead.
+  mean of successful matching baseline runs. A positive value means that the
+  complete DMTCP execution was slower than the baseline; a negative value means
+  that it was faster;
+- **Residual DMTCP runtime difference:** total DMTCP-related overhead minus the
+  explicitly measured checkpoint/restore workflow overhead. This is a signed
+  difference, not a value clamped to zero:
+  - a positive value means that execution outside the checkpoint/restore
+    workflow was slower than the baseline;
+  - a negative value means that execution outside the checkpoint/restore
+    workflow was faster than the baseline;
+  - a value near zero means that no measurable difference was observed.
 
 Important metric files:
 
@@ -514,32 +527,48 @@ post_checkpoint_stabilization_seconds.txt
 original_shutdown_seconds.txt
 socket_cleanup_sleep_seconds.txt
 dmtcp_restore_seconds.txt
-checkpoint_restore_procedure_overhead_seconds.txt
+checkpoint_restore_workflow_overhead_seconds.txt
 total_dmtcp_related_overhead_seconds.txt
 total_dmtcp_related_overhead_percent.txt
-residual_dmtcp_runtime_overhead_seconds.txt
+residual_dmtcp_runtime_difference_seconds.txt
 checkpoint_size_gb.txt
 checkpoint_mean_per_rank_gb.txt
 baseline_reference_seconds.txt
-additional_overhead_seconds.txt
-additional_overhead_percent.txt
 execution_summary.txt
 ```
 
-`additional_overhead_seconds.txt` and `additional_overhead_percent.txt` are kept
-as backward-compatible aliases for the total DMTCP-related overhead metrics.
+The following files are retained as backward-compatible aliases for existing
+analysis scripts and result directories:
+
+```text
+checkpoint_restore_procedure_overhead_seconds.txt
+residual_dmtcp_runtime_overhead_seconds.txt
+additional_overhead_seconds.txt
+additional_overhead_percent.txt
+```
 
 A direct checkpoint/restart run without a matching successful baseline still
-records the DMTCP checkpoint/restore procedure overhead. The total DMTCP-related
-overhead and residual DMTCP runtime overhead are recorded as `N/A` because they
-require a baseline reference.
+records the DMTCP checkpoint/restore workflow overhead. The total DMTCP-related
+overhead and residual DMTCP runtime difference are recorded as `N/A` because
+they require a baseline reference.
 
 ### Summaries
 
-With the default output path:
+The summarizer reads successful BT and CG runs, including baseline,
+percentage-target, and direct-delay directories. It uses the new metric names
+when available and falls back to the compatibility aliases for older result
+directories.
+
+With the default repository-local results path:
 
 ```bash
 python3 scripts/summarize_results.py
+```
+
+This reads:
+
+```text
+<repository-root>/output/results/
 ```
 
 With a custom results path:
@@ -549,12 +578,28 @@ python3 scripts/summarize_results.py \
   --results-root /scratch/npb-dmtcp-output/results
 ```
 
-Generated CSV files:
+By default, the following files are written inside the selected results root:
 
 ```text
 per_run_results.csv
 aggregate_results.csv
 ```
+
+A separate CSV destination may be selected without changing the input results
+path:
+
+```bash
+python3 scripts/summarize_results.py \
+  --results-root /scratch/npb-dmtcp-output/results \
+  --output-dir /scratch/npb-dmtcp-summaries
+```
+
+`per_run_results.csv` contains one row per successful repetition, including the
+workflow overhead, total DMTCP-related overhead, signed residual runtime
+difference, and explicit faster/slower interpretation fields.
+`aggregate_results.csv` groups matching repetitions and reports their means and
+sample standard deviations. A group containing only one successful repetition
+has a standard deviation of `0`.
 
 ### Checkpoint retention
 

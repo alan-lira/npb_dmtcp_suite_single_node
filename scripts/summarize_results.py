@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+
 # Copyright 2026 Alan Lira Nunes
 # SPDX-License-Identifier: Apache-2.0
 # Licensed under the Apache License, Version 2.0.
@@ -7,484 +9,533 @@ from __future__ import annotations
 
 import argparse
 import csv
+import math
 import re
 import statistics
+import sys
 from collections import defaultdict
 from pathlib import Path
-from typing import Iterable
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
-MODERN_BASELINE = re.compile(
-    r"^(?P<benchmark>bt|cg)(?P<class>[A-F])_np(?P<np>\d+)_baseline_rep(?P<rep>\d+)$",
-    re.IGNORECASE,
-)
-LEGACY_BASELINE = re.compile(
-    r"^(?P<benchmark>bt|cg)(?P<class>[A-F])_np(?P<np>\d+)_baseline_t(?P<target>[0-9p.]+)_rep(?P<rep>\d+)$",
-    re.IGNORECASE,
-)
-MODERN_CR = re.compile(
-    r"^(?P<benchmark>bt|cg)(?P<class>[A-F])_np(?P<np>\d+)_cr_p(?P<point>\d+)_rep(?P<rep>\d+)$",
-    re.IGNORECASE,
-)
-LEGACY_CR = re.compile(
-    r"^(?P<benchmark>bt|cg)(?P<class>[A-F])_np(?P<np>\d+)_cr_t(?P<point>[0-9p.]+)_rep(?P<rep>\d+)$",
+
+RUN_NAME_PATTERN = re.compile(
+    r"^(?P<benchmark>bt|cg)(?P<npb_class>[A-Za-z])_np(?P<mpi_ranks>\d+)_"
+    r"(?:"
+    r"(?P<baseline>baseline)(?:_t(?P<legacy_baseline_target>[0-9p.]+))?"
+    r"|"
+    r"cr_(?:p(?P<checkpoint_percent>\d+)|t(?P<checkpoint_delay>[0-9p.]+))"
+    r")_rep(?P<repetition>\d+)$",
     re.IGNORECASE,
 )
 
 
-def read_text(run_dir: Path, name: str, default: str = "") -> str:
-    path = run_dir / name
-    if not path.exists():
-        return default
-    value = path.read_text().strip()
-    return value if value else default
+PER_RUN_FIELDS = [
+    "run_name",
+    "run_directory",
+    "benchmark",
+    "npb_class",
+    "mpi_ranks",
+    "scenario",
+    "checkpoint_mode",
+    "checkpoint_percent",
+    "checkpoint_delay_seconds",
+    "repetition",
+    "total_seconds",
+    "checkpoint_seconds",
+    "post_checkpoint_stabilization_seconds",
+    "original_shutdown_seconds",
+    "socket_cleanup_seconds",
+    "restore_seconds",
+    "checkpoint_restore_workflow_overhead_seconds",
+    "baseline_reference_seconds",
+    "total_dmtcp_related_overhead_seconds",
+    "total_dmtcp_related_overhead_percent",
+    "total_dmtcp_related_direction",
+    "residual_dmtcp_runtime_difference_seconds",
+    "residual_dmtcp_runtime_direction",
+    "checkpoint_size_gb",
+    "checkpoint_size_gib",
+    "checkpoint_mean_per_rank_gb",
+    "checkpoint_mean_per_rank_gib",
+]
 
 
-def read_float(run_dir: Path, name: str, default: float = 0.0) -> float:
-    value = read_text(run_dir, name, "")
-    if not value or value.upper() == "N/A":
-        return default
-    return float(value)
+AGGREGATE_ID_FIELDS = [
+    "benchmark",
+    "npb_class",
+    "mpi_ranks",
+    "scenario",
+    "checkpoint_mode",
+    "checkpoint_percent",
+    "checkpoint_delay_seconds",
+]
 
 
-def read_int(run_dir: Path, name: str, default: int = 0) -> int:
-    value = read_text(run_dir, name, "")
-    if not value or value.upper() == "N/A":
-        return default
-    return int(float(value))
+AGGREGATE_METRICS = [
+    "total_seconds",
+    "checkpoint_seconds",
+    "restore_seconds",
+    "checkpoint_restore_workflow_overhead_seconds",
+    "baseline_reference_seconds",
+    "total_dmtcp_related_overhead_seconds",
+    "total_dmtcp_related_overhead_percent",
+    "residual_dmtcp_runtime_difference_seconds",
+    "checkpoint_size_gb",
+    "checkpoint_mean_per_rank_gb",
+]
 
 
-def mean_std(values: Iterable[float]) -> tuple[float, float]:
-    materialized = list(values)
-    if not materialized:
-        return 0.0, 0.0
-    return (
-        statistics.mean(materialized),
-        statistics.stdev(materialized) if len(materialized) > 1 else 0.0,
+AGGREGATE_FIELDS = (
+    AGGREGATE_ID_FIELDS
+    + ["successful_repetitions"]
+    + [
+        field
+        for metric in AGGREGATE_METRICS
+        for field in (f"{metric}_mean", f"{metric}_std")
+    ]
+    + [
+        "total_dmtcp_related_direction",
+        "residual_dmtcp_runtime_direction",
+    ]
+)
+
+
+def parse_args() -> argparse.Namespace:
+    repository_root = Path(__file__).resolve().parent.parent
+    default_results_root = repository_root / "output" / "results"
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Summarize successful NPB + DMTCP baseline and checkpoint/restart "
+            "runs and generate per-run and aggregate CSV files."
+        )
     )
-
-
-def parse_run_name(name: str) -> dict | None:
-    for pattern, scenario, mode in (
-        (MODERN_BASELINE, "baseline", "percentage"),
-        (LEGACY_BASELINE, "baseline", "seconds"),
-        (MODERN_CR, "cr", "percentage"),
-        (LEGACY_CR, "cr", "seconds"),
-    ):
-        match = pattern.fullmatch(name)
-        if not match:
-            continue
-        groups = match.groupdict()
-        point_raw = groups.get("point") or groups.get("target") or "0"
-        point = float(point_raw.replace("p", "."))
-        return {
-            "benchmark": groups["benchmark"].lower(),
-            "class": groups["class"].upper(),
-            "np": int(groups["np"]),
-            "scenario": scenario,
-            "mode": mode,
-            "point": point,
-            "rep": int(groups["rep"]),
-        }
-    return None
-
-
-def load_rows(results_root: Path) -> tuple[list[dict], list[str]]:
-    rows: list[dict] = []
-    warnings: list[str] = []
-
-    for run_dir in sorted(results_root.iterdir()):
-        if not run_dir.is_dir():
-            continue
-        parsed = parse_run_name(run_dir.name)
-        if parsed is None:
-            continue
-
-        status = read_text(run_dir, "run_status.txt")
-        if status != "SUCCESS":
-            warnings.append(f"Skipping incomplete or failed run: {run_dir}")
-            continue
-        if not (run_dir / "total_seconds.txt").exists():
-            warnings.append(f"Skipping run without total_seconds.txt: {run_dir}")
-            continue
-
-        row = dict(parsed)
-        row.update(
-            {
-                "path": run_dir,
-                "total_s": read_float(run_dir, "total_seconds.txt"),
-                "target_s": read_float(run_dir, "checkpoint_target_seconds.txt"),
-                "checkpoint_s": read_float(
-                    run_dir,
-                    "checkpoint_seconds.txt",
-                    read_float(run_dir, "checkpoint_overhead_seconds.txt"),
-                ),
-                "restore_s": read_float(
-                    run_dir,
-                    "dmtcp_restore_seconds.txt",
-                    read_float(run_dir, "restore_seconds.txt"),
-                ),
-                "post_restore_s": read_float(
-                    run_dir, "post_dmtcp_restore_runtime_seconds.txt"
-                ),
-                "checkpoint_size_gb": read_float(
-                    run_dir,
-                    "checkpoint_size_gb.txt",
-                    read_float(run_dir, "checkpoint_size_gib.txt") * (1024**3) / 1e9,
-                ),
-                "checkpoint_mean_rank_gb": read_float(
-                    run_dir, "checkpoint_mean_per_rank_gb.txt"
-                ),
-                "checkpoint_images": read_int(run_dir, "checkpoint_image_count.txt"),
-                "clients_before": read_int(
-                    run_dir, "dmtcp_clients_before_checkpoint.txt"
-                ),
-                "clients_restored": read_int(
-                    run_dir, "dmtcp_clients_running_after_restore.txt"
-                ),
-                "restore_complete": read_int(
-                    run_dir, "dmtcp_restore_marker_found.txt"
-                ),
-                "npb_verified": read_int(
-                    run_dir, "npb_verification_successful.txt"
-                ),
-                "dmtcp_signal": read_int(run_dir, "dmtcp_signal.txt"),
-                "coordinator_lifecycle": read_text(
-                    run_dir, "coordinator_lifecycle.txt", "fresh"
-                ),
-                "dmtcp_port": read_int(run_dir, "dmtcp_coord_port.txt"),
-                "dmtcp_commit": read_text(run_dir, "dmtcp_commit.txt", "unknown"),
-                "mpich_version": read_text(run_dir, "mpich_version.txt", "unknown"),
-                "mpich_device": read_text(run_dir, "mpich_device.txt", "unknown"),
-            }
-        )
-        if row["checkpoint_mean_rank_gb"] == 0.0 and row["np"] > 0:
-            row["checkpoint_mean_rank_gb"] = row["checkpoint_size_gb"] / row["np"]
-        rows.append(row)
-
-    return rows, warnings
-
-
-def attach_baselines(rows: list[dict], warnings: list[str]) -> None:
-    baselines: dict[tuple[str, str, int], list[float]] = defaultdict(list)
-    for row in rows:
-        if row["scenario"] == "baseline":
-            baselines[(row["benchmark"], row["class"], row["np"])].append(
-                row["total_s"]
-            )
-
-    for row in rows:
-        values = baselines.get((row["benchmark"], row["class"], row["np"]), [])
-        if not values:
-            row["baseline_mean_s"] = None
-            row["baseline_std_s"] = None
-            row["overhead_s"] = None
-            row["overhead_percent"] = None
-            if row["scenario"] == "cr":
-                warnings.append(
-                    f"No baseline available for {row['benchmark'].upper()}.{row['class']}, ranks={row['np']}"
-                )
-            continue
-
-        baseline_mean, baseline_std = mean_std(values)
-        row["baseline_mean_s"] = baseline_mean
-        row["baseline_std_s"] = baseline_std
-        if row["scenario"] == "cr":
-            overhead = row["total_s"] - baseline_mean
-            row["overhead_s"] = overhead
-            row["overhead_percent"] = overhead / baseline_mean * 100 if baseline_mean else 0.0
-        else:
-            row["overhead_s"] = 0.0
-            row["overhead_percent"] = 0.0
-
-
-def write_per_run_csv(results_root: Path, rows: list[dict]) -> Path:
-    output = results_root / "per_run_results.csv"
-    fieldnames = [
-        "benchmark",
-        "class",
-        "mpi_ranks",
-        "scenario",
-        "checkpoint_mode",
-        "checkpoint_point",
-        "checkpoint_target_seconds",
-        "repetition",
-        "baseline_mean_seconds",
-        "baseline_std_seconds",
-        "total_seconds",
-        "checkpoint_seconds",
-        "restore_seconds",
-        "post_restore_runtime_seconds",
-        "additional_overhead_seconds",
-        "additional_overhead_percent",
-        "checkpoint_size_total_gb",
-        "checkpoint_size_mean_per_rank_gb",
-        "checkpoint_image_count",
-        "clients_before_checkpoint",
-        "clients_restored",
-        "restore_complete",
-        "npb_verification_successful",
-        "dmtcp_signal",
-        "coordinator_lifecycle",
-        "dmtcp_port",
-        "dmtcp_commit",
-        "mpich_version",
-        "mpich_device",
-        "run_directory",
-    ]
-
-    with output.open("w", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fieldnames)
-        writer.writeheader()
-        for row in sorted(
-            rows,
-            key=lambda item: (
-                item["benchmark"],
-                item["class"],
-                item["np"],
-                item["scenario"],
-                item["mode"],
-                item["point"],
-                item["rep"],
-            ),
-        ):
-            writer.writerow(
-                {
-                    "benchmark": row["benchmark"],
-                    "class": row["class"],
-                    "mpi_ranks": row["np"],
-                    "scenario": row["scenario"],
-                    "checkpoint_mode": row["mode"],
-                    "checkpoint_point": row["point"],
-                    "checkpoint_target_seconds": row["target_s"],
-                    "repetition": row["rep"],
-                    "baseline_mean_seconds": row["baseline_mean_s"],
-                    "baseline_std_seconds": row["baseline_std_s"],
-                    "total_seconds": row["total_s"],
-                    "checkpoint_seconds": row["checkpoint_s"],
-                    "restore_seconds": row["restore_s"],
-                    "post_restore_runtime_seconds": row["post_restore_s"],
-                    "additional_overhead_seconds": row["overhead_s"],
-                    "additional_overhead_percent": row["overhead_percent"],
-                    "checkpoint_size_total_gb": row["checkpoint_size_gb"],
-                    "checkpoint_size_mean_per_rank_gb": row[
-                        "checkpoint_mean_rank_gb"
-                    ],
-                    "checkpoint_image_count": row["checkpoint_images"],
-                    "clients_before_checkpoint": row["clients_before"],
-                    "clients_restored": row["clients_restored"],
-                    "restore_complete": row["restore_complete"],
-                    "npb_verification_successful": row["npb_verified"],
-                    "dmtcp_signal": row["dmtcp_signal"],
-                    "coordinator_lifecycle": row["coordinator_lifecycle"],
-                    "dmtcp_port": row["dmtcp_port"],
-                    "dmtcp_commit": row["dmtcp_commit"],
-                    "mpich_version": row["mpich_version"],
-                    "mpich_device": row["mpich_device"],
-                    "run_directory": str(row["path"]),
-                }
-            )
-    return output
-
-
-def aggregate(rows: list[dict]) -> list[dict]:
-    groups: dict[tuple, list[dict]] = defaultdict(list)
-    for row in rows:
-        if row["scenario"] != "cr" or row["baseline_mean_s"] is None:
-            continue
-        key = (
-            row["benchmark"],
-            row["class"],
-            row["np"],
-            row["mode"],
-            row["point"],
-        )
-        groups[key].append(row)
-
-    output: list[dict] = []
-    for key, group in sorted(groups.items()):
-        benchmark, npb_class, np, mode, point = key
-        values = lambda field: [item[field] for item in group]
-        output.append(
-            {
-                "benchmark": benchmark,
-                "class": npb_class,
-                "np": np,
-                "mode": mode,
-                "point": point,
-                "repetitions": len(group),
-                "baseline": mean_std(values("baseline_mean_s")),
-                "target": mean_std(values("target_s")),
-                "total": mean_std(values("total_s")),
-                "checkpoint": mean_std(values("checkpoint_s")),
-                "restore": mean_std(values("restore_s")),
-                "post_restore": mean_std(values("post_restore_s")),
-                "overhead": mean_std(values("overhead_s")),
-                "overhead_percent": mean_std(values("overhead_percent")),
-                "size_total": mean_std(values("checkpoint_size_gb")),
-                "size_rank": mean_std(values("checkpoint_mean_rank_gb")),
-                "all_restored": all(item["restore_complete"] == 1 for item in group),
-                "all_verified": all(item["npb_verified"] == 1 for item in group),
-                "dmtcp_signal": group[0]["dmtcp_signal"],
-                "coordinator_lifecycle": group[0]["coordinator_lifecycle"],
-            }
-        )
-    return output
-
-
-def write_aggregate_csv(results_root: Path, aggregates: list[dict]) -> Path:
-    output = results_root / "aggregate_results.csv"
-    fieldnames = [
-        "benchmark",
-        "class",
-        "mpi_ranks",
-        "checkpoint_mode",
-        "checkpoint_point",
-        "repetitions",
-        "baseline_mean_seconds",
-        "baseline_std_seconds",
-        "checkpoint_target_mean_seconds",
-        "checkpoint_target_std_seconds",
-        "total_mean_seconds",
-        "total_std_seconds",
-        "checkpoint_mean_seconds",
-        "checkpoint_std_seconds",
-        "restore_mean_seconds",
-        "restore_std_seconds",
-        "post_restore_runtime_mean_seconds",
-        "post_restore_runtime_std_seconds",
-        "additional_overhead_mean_seconds",
-        "additional_overhead_std_seconds",
-        "additional_overhead_percent_mean",
-        "additional_overhead_percent_std",
-        "checkpoint_size_total_mean_gb",
-        "checkpoint_size_total_std_gb",
-        "checkpoint_size_mean_per_rank_gb",
-        "checkpoint_size_mean_per_rank_std_gb",
-        "all_restores_complete",
-        "all_npb_verifications_successful",
-        "dmtcp_signal",
-        "coordinator_lifecycle",
-    ]
-
-    with output.open("w", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fieldnames)
-        writer.writeheader()
-        for item in aggregates:
-            writer.writerow(
-                {
-                    "benchmark": item["benchmark"],
-                    "class": item["class"],
-                    "mpi_ranks": item["np"],
-                    "checkpoint_mode": item["mode"],
-                    "checkpoint_point": item["point"],
-                    "repetitions": item["repetitions"],
-                    "baseline_mean_seconds": item["baseline"][0],
-                    "baseline_std_seconds": item["baseline"][1],
-                    "checkpoint_target_mean_seconds": item["target"][0],
-                    "checkpoint_target_std_seconds": item["target"][1],
-                    "total_mean_seconds": item["total"][0],
-                    "total_std_seconds": item["total"][1],
-                    "checkpoint_mean_seconds": item["checkpoint"][0],
-                    "checkpoint_std_seconds": item["checkpoint"][1],
-                    "restore_mean_seconds": item["restore"][0],
-                    "restore_std_seconds": item["restore"][1],
-                    "post_restore_runtime_mean_seconds": item["post_restore"][0],
-                    "post_restore_runtime_std_seconds": item["post_restore"][1],
-                    "additional_overhead_mean_seconds": item["overhead"][0],
-                    "additional_overhead_std_seconds": item["overhead"][1],
-                    "additional_overhead_percent_mean": item["overhead_percent"][0],
-                    "additional_overhead_percent_std": item["overhead_percent"][1],
-                    "checkpoint_size_total_mean_gb": item["size_total"][0],
-                    "checkpoint_size_total_std_gb": item["size_total"][1],
-                    "checkpoint_size_mean_per_rank_gb": item["size_rank"][0],
-                    "checkpoint_size_mean_per_rank_std_gb": item["size_rank"][1],
-                    "all_restores_complete": item["all_restored"],
-                    "all_npb_verifications_successful": item["all_verified"],
-                    "dmtcp_signal": item["dmtcp_signal"],
-                    "coordinator_lifecycle": item["coordinator_lifecycle"],
-                }
-            )
-    return output
-
-
-def fmt(pair: tuple[float, float], digits: int = 2) -> str:
-    return f"{pair[0]:.{digits}f} ± {pair[1]:.{digits}f}"
-
-
-def print_summary(rows: list[dict], aggregates: list[dict]) -> None:
-    baselines: dict[tuple[str, str, int], list[float]] = defaultdict(list)
-    for row in rows:
-        if row["scenario"] == "baseline":
-            baselines[(row["benchmark"], row["class"], row["np"])].append(row["total_s"])
-
-    grouped: dict[tuple[str, str, int], list[dict]] = defaultdict(list)
-    for item in aggregates:
-        grouped[(item["benchmark"], item["class"], item["np"])].append(item)
-
-    print("\nNPB/DMTCP checkpoint/restore summary")
-    print("====================================")
-    for key in sorted(set(baselines) | set(grouped)):
-        benchmark, npb_class, np = key
-        print(f"\n{benchmark.upper()}.{npb_class}, MPI ranks={np}")
-        baseline_values = baselines.get(key, [])
-        if baseline_values:
-            print(f"Baseline: {fmt(mean_std(baseline_values))} s ({len(baseline_values)} reps)")
-        else:
-            print("Baseline: unavailable")
-        print(
-            "Point | Reps | Total (s) | Checkpoint (s) | Restore (s) | "
-            "Overhead (s) | Overhead (%) | Size total (GB) | Mean/rank (GB)"
-        )
-        print("-" * 145)
-        for item in grouped.get(key, []):
-            point = f"{item['point']:.0f}%" if item["mode"] == "percentage" else f"{item['point']:g}s"
-            print(
-                f"{point:>5} | {item['repetitions']:>4} | "
-                f"{fmt(item['total'])} | {fmt(item['checkpoint'])} | "
-                f"{fmt(item['restore'])} | {fmt(item['overhead'])} | "
-                f"{fmt(item['overhead_percent'])} | "
-                f"{fmt(item['size_total'], 3)} | {fmt(item['size_rank'], 4)}"
-            )
-
-    print("\nDefinitions")
-    print("-----------")
-    print("Total: original DMTCP launch through completion of the restored benchmark.")
-    print("Checkpoint: checkpoint request through visibility of all images and restart script.")
-    print("Restore: restart-script launch until all expected DMTCP clients are RUNNING.")
-    print("Overhead: total CR duration minus the matching baseline mean.")
-
-
-def main() -> int:
-    parser = argparse.ArgumentParser()
     parser.add_argument(
         "--results-root",
         type=Path,
-        default=Path(__file__).resolve().parent.parent / "output" / "results",
+        default=default_results_root,
+        help=(
+            "Directory containing run folders. Default: "
+            f"{default_results_root}"
+        ),
     )
-    args = parser.parse_args()
-    root = args.results_root.expanduser().resolve()
-    if not root.is_dir():
-        parser.error(f"results directory not found: {root}")
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Directory for per_run_results.csv and aggregate_results.csv. "
+            "Default: the selected results root."
+        ),
+    )
+    return parser.parse_args()
 
-    rows, warnings = load_rows(root)
-    if not rows:
-        parser.error(f"no completed result runs found in {root}")
-    attach_baselines(rows, warnings)
-    aggregates = aggregate(rows)
-    per_run = write_per_run_csv(root, rows)
-    aggregate_csv = write_aggregate_csv(root, aggregates)
-    print_summary(rows, aggregates)
 
-    if warnings:
-        print("\nWarnings")
-        print("--------")
-        for warning in dict.fromkeys(warnings):
-            print(f"- {warning}")
+def read_text(run_dir: Path, name: str) -> Optional[str]:
+    path = run_dir / name
+    if not path.is_file():
+        return None
+    value = path.read_text(encoding="utf-8", errors="replace").strip()
+    return value or None
 
-    print("\nCSV outputs")
-    print("-----------")
-    print(per_run)
-    print(aggregate_csv)
+
+def read_number(run_dir: Path, names: Sequence[str]) -> Optional[float]:
+    for name in names:
+        text = read_text(run_dir, name)
+        if text is None or text.upper() == "N/A":
+            continue
+        try:
+            value = float(text)
+        except ValueError:
+            continue
+        if math.isfinite(value):
+            return value
+    return None
+
+
+def decode_delay(value: Optional[str]) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        return float(value.replace("p", "."))
+    except ValueError:
+        return None
+
+
+def signed_direction(value: Optional[float]) -> str:
+    if value is None:
+        return "N/A"
+    epsilon = 0.5e-6
+    if value > epsilon:
+        return "slower than baseline"
+    if value < -epsilon:
+        return "faster than baseline"
+    return "no measurable difference"
+
+
+def residual_direction(value: Optional[float]) -> str:
+    direction = signed_direction(value)
+    if direction == "slower than baseline":
+        return "slower than baseline outside checkpoint/restore workflow"
+    if direction == "faster than baseline":
+        return "faster than baseline outside checkpoint/restore workflow"
+    if direction == "no measurable difference":
+        return "no measurable difference outside checkpoint/restore workflow"
+    return direction
+
+
+def short_direction(value: object) -> str:
+    if not isinstance(value, (int, float)):
+        return "N/A"
+    direction = signed_direction(float(value))
+    if direction == "slower than baseline":
+        return "slower"
+    if direction == "faster than baseline":
+        return "faster"
+    return "same"
+
+
+def sum_available(values: Iterable[Optional[float]]) -> Optional[float]:
+    materialized = list(values)
+    if any(value is None for value in materialized):
+        return None
+    return sum(value for value in materialized if value is not None)
+
+
+def parse_run_directory(run_dir: Path) -> Optional[Dict[str, object]]:
+    match = RUN_NAME_PATTERN.fullmatch(run_dir.name)
+    if match is None:
+        return None
+
+    status = read_text(run_dir, "run_status.txt")
+    if status != "SUCCESS":
+        return None
+
+    scenario = "baseline" if match.group("baseline") else "cr"
+    checkpoint_percent: Optional[int] = None
+    checkpoint_delay = None
+    checkpoint_mode = "none"
+
+    if scenario == "cr" and match.group("checkpoint_percent") is not None:
+        checkpoint_mode = "percent"
+        checkpoint_percent = int(match.group("checkpoint_percent"))
+    elif scenario == "cr":
+        checkpoint_mode = "delay"
+        checkpoint_delay = decode_delay(match.group("checkpoint_delay"))
+
+    checkpoint_seconds = read_number(
+        run_dir, ("checkpoint_seconds.txt", "checkpoint_overhead_seconds.txt")
+    )
+    stabilization_seconds = read_number(
+        run_dir, ("post_checkpoint_stabilization_seconds.txt",)
+    )
+    shutdown_seconds = read_number(run_dir, ("original_shutdown_seconds.txt",))
+    socket_cleanup_seconds = read_number(
+        run_dir, ("socket_cleanup_sleep_seconds.txt",)
+    )
+    restore_seconds = read_number(
+        run_dir, ("dmtcp_restore_seconds.txt", "restore_seconds.txt")
+    )
+
+    workflow_overhead = read_number(
+        run_dir,
+        (
+            "checkpoint_restore_workflow_overhead_seconds.txt",
+            "checkpoint_restore_procedure_overhead_seconds.txt",
+        ),
+    )
+    if workflow_overhead is None:
+        workflow_overhead = sum_available(
+            (
+                checkpoint_seconds,
+                stabilization_seconds,
+                shutdown_seconds,
+                socket_cleanup_seconds,
+                restore_seconds,
+            )
+        )
+
+    total_seconds = read_number(run_dir, ("total_seconds.txt", "total_wall_seconds.txt"))
+    baseline_reference = read_number(run_dir, ("baseline_reference_seconds.txt",))
+    total_overhead = read_number(
+        run_dir,
+        (
+            "total_dmtcp_related_overhead_seconds.txt",
+            "additional_overhead_seconds.txt",
+        ),
+    )
+    if total_overhead is None and total_seconds is not None and baseline_reference is not None:
+        total_overhead = total_seconds - baseline_reference
+
+    total_overhead_percent = read_number(
+        run_dir,
+        (
+            "total_dmtcp_related_overhead_percent.txt",
+            "additional_overhead_percent.txt",
+        ),
+    )
+    if (
+        total_overhead_percent is None
+        and total_overhead is not None
+        and baseline_reference not in (None, 0.0)
+    ):
+        total_overhead_percent = total_overhead / baseline_reference * 100.0
+
+    residual_difference = read_number(
+        run_dir,
+        (
+            "residual_dmtcp_runtime_difference_seconds.txt",
+            "residual_dmtcp_runtime_overhead_seconds.txt",
+        ),
+    )
+    if residual_difference is None and total_overhead is not None and workflow_overhead is not None:
+        residual_difference = total_overhead - workflow_overhead
+
+    row: Dict[str, object] = {
+        "run_name": run_dir.name,
+        "run_directory": str(run_dir.resolve()),
+        "benchmark": match.group("benchmark").upper(),
+        "npb_class": match.group("npb_class").upper(),
+        "mpi_ranks": int(match.group("mpi_ranks")),
+        "scenario": scenario,
+        "checkpoint_mode": checkpoint_mode,
+        "checkpoint_percent": checkpoint_percent,
+        "checkpoint_delay_seconds": checkpoint_delay,
+        "repetition": int(match.group("repetition")),
+        "total_seconds": total_seconds,
+        "checkpoint_seconds": checkpoint_seconds,
+        "post_checkpoint_stabilization_seconds": stabilization_seconds,
+        "original_shutdown_seconds": shutdown_seconds,
+        "socket_cleanup_seconds": socket_cleanup_seconds,
+        "restore_seconds": restore_seconds,
+        "checkpoint_restore_workflow_overhead_seconds": workflow_overhead,
+        "baseline_reference_seconds": baseline_reference,
+        "total_dmtcp_related_overhead_seconds": total_overhead,
+        "total_dmtcp_related_overhead_percent": total_overhead_percent,
+        "total_dmtcp_related_direction": signed_direction(total_overhead),
+        "residual_dmtcp_runtime_difference_seconds": residual_difference,
+        "residual_dmtcp_runtime_direction": residual_direction(residual_difference),
+        "checkpoint_size_gb": read_number(run_dir, ("checkpoint_size_gb.txt",)),
+        "checkpoint_size_gib": read_number(run_dir, ("checkpoint_size_gib.txt",)),
+        "checkpoint_mean_per_rank_gb": read_number(
+            run_dir, ("checkpoint_mean_per_rank_gb.txt",)
+        ),
+        "checkpoint_mean_per_rank_gib": read_number(
+            run_dir, ("checkpoint_mean_per_rank_gib.txt",)
+        ),
+    }
+    return row
+
+
+def mean_std(values: Sequence[float]) -> Tuple[Optional[float], Optional[float]]:
+    if not values:
+        return None, None
+    if len(values) == 1:
+        return values[0], 0.0
+    return statistics.mean(values), statistics.stdev(values)
+
+
+def aggregate_rows(rows: Sequence[Dict[str, object]]) -> List[Dict[str, object]]:
+    groups: Dict[Tuple[object, ...], List[Dict[str, object]]] = defaultdict(list)
+    for row in rows:
+        key = tuple(row[field] for field in AGGREGATE_ID_FIELDS)
+        groups[key].append(row)
+
+    def group_sort_key(item: Tuple[object, ...]) -> Tuple[object, ...]:
+        benchmark, npb_class, mpi_ranks, scenario, mode, percent, delay = item
+        scenario_order = 0 if scenario == "baseline" else 1
+        mode_order = {"none": 0, "percent": 1, "delay": 2}.get(str(mode), 9)
+        target = percent if percent is not None else delay if delay is not None else -1
+        return (
+            str(benchmark),
+            str(npb_class),
+            int(mpi_ranks),
+            scenario_order,
+            mode_order,
+            float(target),
+        )
+
+    aggregate: List[Dict[str, object]] = []
+    for key in sorted(groups, key=group_sort_key):
+        members = groups[key]
+        record: Dict[str, object] = dict(zip(AGGREGATE_ID_FIELDS, key))
+        record["successful_repetitions"] = len(members)
+
+        for metric in AGGREGATE_METRICS:
+            values = [
+                float(row[metric])
+                for row in members
+                if isinstance(row.get(metric), (int, float))
+                and math.isfinite(float(row[metric]))
+            ]
+            mean_value, std_value = mean_std(values)
+            record[f"{metric}_mean"] = mean_value
+            record[f"{metric}_std"] = std_value
+
+        record["total_dmtcp_related_direction"] = signed_direction(
+            record.get("total_dmtcp_related_overhead_seconds_mean")
+        )
+        record["residual_dmtcp_runtime_direction"] = residual_direction(
+            record.get("residual_dmtcp_runtime_difference_seconds_mean")
+        )
+        aggregate.append(record)
+
+    return aggregate
+
+
+def csv_value(value: object) -> object:
+    if value is None:
+        return "N/A"
+    if isinstance(value, float):
+        return f"{value:.9f}"
+    return value
+
+
+def write_csv(path: Path, fields: Sequence[str], rows: Sequence[Dict[str, object]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({field: csv_value(row.get(field)) for field in fields})
+
+
+def format_value(value: object, digits: int = 2) -> str:
+    if not isinstance(value, (int, float)):
+        return "N/A"
+    return f"{float(value):.{digits}f}"
+
+
+def target_label(row: Dict[str, object]) -> str:
+    if row["scenario"] == "baseline":
+        return "baseline"
+    if row["checkpoint_mode"] == "percent":
+        return f"{row['checkpoint_percent']}%"
+    return f"{format_value(row['checkpoint_delay_seconds'])} s"
+
+
+def print_console_summary(
+    per_run: Sequence[Dict[str, object]], aggregate: Sequence[Dict[str, object]]
+) -> None:
+    identities = sorted(
+        {
+            (str(row["benchmark"]), str(row["npb_class"]), int(row["mpi_ranks"]))
+            for row in per_run
+        }
+    )
+
+    for benchmark, npb_class, mpi_ranks in identities:
+        matching = [
+            row
+            for row in aggregate
+            if row["benchmark"] == benchmark
+            and row["npb_class"] == npb_class
+            and row["mpi_ranks"] == mpi_ranks
+        ]
+        baseline = next((row for row in matching if row["scenario"] == "baseline"), None)
+
+        print()
+        print(f"{benchmark}.{npb_class} | MPI ranks={mpi_ranks}")
+        print("=" * 72)
+        if baseline is None:
+            print("Baseline: unavailable")
+        else:
+            print(
+                "Baseline: "
+                f"{format_value(baseline['total_seconds_mean'])} ± "
+                f"{format_value(baseline['total_seconds_std'])} s "
+                f"({baseline['successful_repetitions']} successful repetitions)"
+            )
+
+        cr_rows = [row for row in matching if row["scenario"] == "cr"]
+        if not cr_rows:
+            print("No successful checkpoint/restart runs found.")
+            continue
+
+        print()
+        print(
+            "Target | Reps | Total (s) | Checkpoint (s) | Restore (s) | "
+            "Workflow (s) | Total DMTCP | Residual difference | Size (GB)"
+        )
+        print("-" * 160)
+        for row in cr_rows:
+            total_direction = short_direction(
+                row.get("total_dmtcp_related_overhead_seconds_mean")
+            )
+            residual_direction_short = short_direction(
+                row.get("residual_dmtcp_runtime_difference_seconds_mean")
+            )
+            total_summary = (
+                f"{format_value(row['total_dmtcp_related_overhead_percent_mean'])}% "
+                f"({total_direction})"
+            )
+            residual_summary = (
+                f"{format_value(row['residual_dmtcp_runtime_difference_seconds_mean'])} s "
+                f"({residual_direction_short})"
+            )
+            print(
+                f"{target_label(row):>7} | "
+                f"{int(row['successful_repetitions']):4d} | "
+                f"{format_value(row['total_seconds_mean']):>9} | "
+                f"{format_value(row['checkpoint_seconds_mean']):>14} | "
+                f"{format_value(row['restore_seconds_mean']):>11} | "
+                f"{format_value(row['checkpoint_restore_workflow_overhead_seconds_mean']):>12} | "
+                f"{total_summary:>19} | "
+                f"{residual_summary:>24} | "
+                f"{format_value(row['checkpoint_size_gb_mean']):>9}"
+            )
+
+
+def main() -> int:
+    args = parse_args()
+    results_root = args.results_root.expanduser().resolve()
+    output_dir = (
+        args.output_dir.expanduser().resolve()
+        if args.output_dir is not None
+        else results_root
+    )
+
+    if not results_root.is_dir():
+        print(f"ERROR: results directory not found: {results_root}", file=sys.stderr)
+        return 1
+
+    per_run: List[Dict[str, object]] = []
+    matching_directories = 0
+    skipped_unsuccessful = 0
+
+    for run_dir in sorted(results_root.iterdir()):
+        if not run_dir.is_dir() or RUN_NAME_PATTERN.fullmatch(run_dir.name) is None:
+            continue
+        matching_directories += 1
+        row = parse_run_directory(run_dir)
+        if row is None:
+            skipped_unsuccessful += 1
+            continue
+        per_run.append(row)
+
+    if not per_run:
+        print(
+            f"ERROR: no successful result folders found under {results_root}",
+            file=sys.stderr,
+        )
+        return 1
+
+    aggregate = aggregate_rows(per_run)
+    per_run_path = output_dir / "per_run_results.csv"
+    aggregate_path = output_dir / "aggregate_results.csv"
+    write_csv(per_run_path, PER_RUN_FIELDS, per_run)
+    write_csv(aggregate_path, AGGREGATE_FIELDS, aggregate)
+
+    print_console_summary(per_run, aggregate)
+    print()
+    print(f"Successful runs summarized: {len(per_run)}")
+    if skipped_unsuccessful:
+        print(
+            "Matching failed or incomplete run directories skipped: "
+            f"{skipped_unsuccessful} of {matching_directories}"
+        )
+    print(f"Per-run CSV: {per_run_path}")
+    print(f"Aggregate CSV: {aggregate_path}")
     return 0
 
 
