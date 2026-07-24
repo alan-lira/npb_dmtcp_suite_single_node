@@ -595,26 +595,75 @@ total = float(sys.argv[1])
 baseline = float(sys.argv[2])
 overhead = total - baseline
 percent = overhead / baseline * 100 if baseline else 0.0
+
+# Backward-compatible metric names.
 Path('additional_overhead_seconds.txt').write_text(f'{overhead:.9f}\n')
 Path('additional_overhead_percent.txt').write_text(f'{percent:.9f}\n')
+
+# Explicit metric names used by the execution summary.
+Path('total_dmtcp_related_overhead_seconds.txt').write_text(f'{overhead:.9f}\n')
+Path('total_dmtcp_related_overhead_percent.txt').write_text(f'{percent:.9f}\n')
 PY
   else
     echo "N/A" > baseline_reference_seconds.txt
     echo "N/A" > additional_overhead_seconds.txt
     echo "N/A" > additional_overhead_percent.txt
+    echo "N/A" > total_dmtcp_related_overhead_seconds.txt
+    echo "N/A" > total_dmtcp_related_overhead_percent.txt
   fi
 }
 
+write_checkpoint_restore_overhead_metrics() {
+  python3 <<'PY'
+from pathlib import Path
+
+
+def read_number(name: str) -> float:
+    return float(Path(name).read_text().strip())
+
+
+procedure_overhead = sum(
+    read_number(name)
+    for name in (
+        'checkpoint_seconds.txt',
+        'post_checkpoint_stabilization_seconds.txt',
+        'original_shutdown_seconds.txt',
+        'socket_cleanup_sleep_seconds.txt',
+        'dmtcp_restore_seconds.txt',
+    )
+)
+
+Path('checkpoint_restore_procedure_overhead_seconds.txt').write_text(
+    f'{procedure_overhead:.9f}\n'
+)
+
+total_text = Path('total_dmtcp_related_overhead_seconds.txt').read_text().strip()
+
+if total_text == 'N/A':
+    Path('residual_dmtcp_runtime_overhead_seconds.txt').write_text('N/A\n')
+else:
+    total_overhead = float(total_text)
+    residual_overhead = total_overhead - procedure_overhead
+    Path('residual_dmtcp_runtime_overhead_seconds.txt').write_text(
+        f'{residual_overhead:.9f}\n'
+    )
+PY
+}
+
 write_execution_summary() {
-  local total checkpoint restore size_total size_rank baseline overhead overhead_pct
+  local total checkpoint restore size_total size_rank baseline
+  local procedure_overhead total_overhead total_overhead_pct residual_overhead
+
   total="$(<total_seconds.txt)"
   checkpoint="$(<checkpoint_seconds.txt)"
   restore="$(<dmtcp_restore_seconds.txt)"
   size_total="$(<checkpoint_size_gb.txt)"
   size_rank="$(<checkpoint_mean_per_rank_gb.txt)"
   baseline="$(<baseline_reference_seconds.txt)"
-  overhead="$(<additional_overhead_seconds.txt)"
-  overhead_pct="$(<additional_overhead_percent.txt)"
+  procedure_overhead="$(<checkpoint_restore_procedure_overhead_seconds.txt)"
+  total_overhead="$(<total_dmtcp_related_overhead_seconds.txt)"
+  total_overhead_pct="$(<total_dmtcp_related_overhead_percent.txt)"
+  residual_overhead="$(<residual_dmtcp_runtime_overhead_seconds.txt)"
 
   {
     echo "Execution summary"
@@ -628,11 +677,17 @@ write_execution_summary() {
     printf 'Size of checkpoints: %.6f GB total | %.6f GB mean per application rank\n' "${size_total}" "${size_rank}"
     printf 'Time required for the checkpoint step: %.6f seconds\n' "${checkpoint}"
     printf 'Time required for the restore step: %.6f seconds\n' "${restore}"
-    if [ "${overhead}" = "N/A" ]; then
-      echo "Additional overhead: N/A (no successful baseline was available)"
+    printf 'DMTCP checkpoint/restore procedure overhead: %.6f seconds\n' \
+      "${procedure_overhead}"
+
+    if [ "${total_overhead}" = "N/A" ]; then
+      echo "Total DMTCP-related overhead: N/A (no successful baseline was available)"
+      echo "Residual DMTCP runtime overhead: N/A (no successful baseline was available)"
     else
-      printf 'Additional overhead: %.6f seconds (%.3f%% compared with baseline mean %.6f seconds)\n' \
-        "${overhead}" "${overhead_pct}" "${baseline}"
+      printf 'Total DMTCP-related overhead: %.6f seconds (%.3f%% compared with baseline mean %.6f seconds)\n' \
+        "${total_overhead}" "${total_overhead_pct}" "${baseline}"
+      printf 'Residual DMTCP runtime overhead: %.6f seconds\n' \
+        "${residual_overhead}"
     fi
   } > execution_summary.txt
 }
@@ -760,6 +815,7 @@ if [ "${SCENARIO}" = "baseline" ]; then
   echo "1" > npb_verification_successful.txt
   write_zero_cr_metrics
   write_overhead_metrics "$(<total_seconds.txt)"
+  write_checkpoint_restore_overhead_metrics
   write_execution_summary
   echo "SUCCESS" > run_status.txt
 
@@ -1029,6 +1085,7 @@ fi
 
 echo "1" > npb_verification_successful.txt
 write_overhead_metrics "$(<total_seconds.txt)"
+write_checkpoint_restore_overhead_metrics
 write_execution_summary
 delete_checkpoint_artifacts
 echo "SUCCESS" > run_status.txt

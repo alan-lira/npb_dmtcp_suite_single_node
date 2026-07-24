@@ -381,7 +381,9 @@ Total duration: X seconds
 Size of checkpoints: Y1 GB total | Y2 GB mean per application rank
 Time required for the checkpoint step: X seconds
 Time required for the restore step: X seconds
-Additional overhead: X seconds (... compared with baseline mean ...)
+DMTCP checkpoint/restore procedure overhead: X seconds
+Total DMTCP-related overhead: X seconds (... compared with baseline mean ...)
+Residual DMTCP runtime overhead: X seconds
 ```
 
 Definitions:
@@ -394,15 +396,27 @@ Definitions:
 - **Checkpoint total size:** all top-level `ckpt_*` files and associated
   `ckpt_*` directories;
 - **Mean per rank:** checkpoint total size divided by application MPI ranks;
-- **Additional overhead:** checkpoint/restart total duration minus the mean of
-  successful matching baseline runs.
+- **DMTCP checkpoint/restore procedure overhead:** sum of the checkpoint step,
+  post-checkpoint stabilization, original-computation shutdown, socket-cleanup
+  delay, and restore step;
+- **Total DMTCP-related overhead:** checkpoint/restart total duration minus the
+  mean of successful matching baseline runs;
+- **Residual DMTCP runtime overhead:** total DMTCP-related overhead minus the
+  DMTCP checkpoint/restore procedure overhead.
 
 Important metric files:
 
 ```text
 total_seconds.txt
 checkpoint_seconds.txt
+post_checkpoint_stabilization_seconds.txt
+original_shutdown_seconds.txt
+socket_cleanup_sleep_seconds.txt
 dmtcp_restore_seconds.txt
+checkpoint_restore_procedure_overhead_seconds.txt
+total_dmtcp_related_overhead_seconds.txt
+total_dmtcp_related_overhead_percent.txt
+residual_dmtcp_runtime_overhead_seconds.txt
 checkpoint_size_gb.txt
 checkpoint_mean_per_rank_gb.txt
 baseline_reference_seconds.txt
@@ -411,8 +425,13 @@ additional_overhead_percent.txt
 execution_summary.txt
 ```
 
-A direct checkpoint/restart run without a matching successful baseline records
-the additional overhead as `N/A`.
+`additional_overhead_seconds.txt` and `additional_overhead_percent.txt` are kept
+as backward-compatible aliases for the total DMTCP-related overhead metrics.
+
+A direct checkpoint/restart run without a matching successful baseline still
+records the DMTCP checkpoint/restore procedure overhead. The total DMTCP-related
+overhead and residual DMTCP runtime overhead are recorded as `N/A` because they
+require a baseline reference.
 
 ### Summaries
 
