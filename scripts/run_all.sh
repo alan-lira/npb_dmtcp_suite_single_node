@@ -8,6 +8,9 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
+TEST_DIR="${REPO_ROOT}/tests"
+
 # shellcheck source=experiment_config.sh
 source "${SCRIPT_DIR}/experiment_config.sh"
 
