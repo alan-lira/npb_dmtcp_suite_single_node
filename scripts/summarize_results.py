@@ -21,7 +21,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 RUN_NAME_PATTERN = re.compile(
     r"^(?P<benchmark>bt|cg)(?P<npb_class>[A-Za-z])_np(?P<mpi_ranks>\d+)_"
     r"(?:"
-    r"(?P<baseline>baseline)(?:_t(?P<legacy_baseline_target>[0-9p.]+))?"
+    r"(?P<baseline>baseline)"
     r"|"
     r"cr_(?:p(?P<checkpoint_percent>\d+)|t(?P<checkpoint_delay>[0-9p.]+))"
     r")_rep(?P<repetition>\d+)$",
@@ -47,8 +47,10 @@ PER_RUN_FIELDS = [
     "original_shutdown_seconds",
     "pre_restore_endpoint_verification_seconds",
     "pre_restore_final_grace_seconds",
-    "socket_cleanup_seconds",
     "restore_seconds",
+    "successful_restore_attempt_seconds",
+    "restore_attempt_count",
+    "restore_retry_count",
     "checkpoint_restore_workflow_overhead_seconds",
     "baseline_reference_seconds",
     "total_dmtcp_related_overhead_seconds",
@@ -79,6 +81,9 @@ AGGREGATE_METRICS = [
     "checkpoint_seconds",
     "pre_restore_cleanup_seconds",
     "restore_seconds",
+    "successful_restore_attempt_seconds",
+    "restore_attempt_count",
+    "restore_retry_count",
     "checkpoint_restore_workflow_overhead_seconds",
     "baseline_reference_seconds",
     "total_dmtcp_related_overhead_seconds",
@@ -211,8 +216,7 @@ def parse_run_directory(run_dir: Path) -> Optional[Dict[str, object]]:
     if match is None:
         return None
 
-    status = read_text(run_dir, "run_status.txt")
-    if status != "SUCCESS":
+    if not (run_dir / "SUCCESS.marker").is_file():
         return None
 
     scenario = "baseline" if match.group("baseline") else "cr"
@@ -227,9 +231,7 @@ def parse_run_directory(run_dir: Path) -> Optional[Dict[str, object]]:
         checkpoint_mode = "delay"
         checkpoint_delay = decode_delay(match.group("checkpoint_delay"))
 
-    checkpoint_seconds = read_number(
-        run_dir, ("checkpoint_seconds.txt", "checkpoint_overhead_seconds.txt")
-    )
+    checkpoint_seconds = read_number(run_dir, ("checkpoint_seconds.txt",))
     stabilization_seconds = read_number(
         run_dir, ("post_checkpoint_stabilization_seconds.txt",)
     )
@@ -240,26 +242,18 @@ def parse_run_directory(run_dir: Path) -> Optional[Dict[str, object]]:
     final_grace_seconds = read_number(
         run_dir, ("pre_restore_final_grace_seconds.txt",)
     )
-    socket_cleanup_seconds = read_number(
-        run_dir, ("socket_cleanup_sleep_seconds.txt",)
-    )
     pre_restore_cleanup_seconds = read_number(
         run_dir, ("pre_restore_cleanup_seconds.txt",)
     )
-    if pre_restore_cleanup_seconds is None:
-        pre_restore_cleanup_seconds = sum_available(
-            (shutdown_seconds, socket_cleanup_seconds)
-        )
-    restore_seconds = read_number(
-        run_dir, ("dmtcp_restore_seconds.txt", "restore_seconds.txt")
+    restore_seconds = read_number(run_dir, ("dmtcp_restore_seconds.txt",))
+    successful_restore_attempt_seconds = read_number(
+        run_dir, ("successful_restore_attempt_seconds.txt",)
     )
+    restore_attempt_count = read_number(run_dir, ("restore_attempt_count.txt",))
+    restore_retry_count = read_number(run_dir, ("restore_retry_count.txt",))
 
     workflow_overhead = read_number(
-        run_dir,
-        (
-            "checkpoint_restore_workflow_overhead_seconds.txt",
-            "checkpoint_restore_procedure_overhead_seconds.txt",
-        ),
+        run_dir, ("checkpoint_restore_workflow_overhead_seconds.txt",)
     )
     if workflow_overhead is None:
         workflow_overhead = sum_available(
@@ -271,24 +265,16 @@ def parse_run_directory(run_dir: Path) -> Optional[Dict[str, object]]:
             )
         )
 
-    total_seconds = read_number(run_dir, ("total_seconds.txt", "total_wall_seconds.txt"))
+    total_seconds = read_number(run_dir, ("total_seconds.txt",))
     baseline_reference = read_number(run_dir, ("baseline_reference_seconds.txt",))
     total_overhead = read_number(
-        run_dir,
-        (
-            "total_dmtcp_related_overhead_seconds.txt",
-            "additional_overhead_seconds.txt",
-        ),
+        run_dir, ("total_dmtcp_related_overhead_seconds.txt",)
     )
     if total_overhead is None and total_seconds is not None and baseline_reference is not None:
         total_overhead = total_seconds - baseline_reference
 
     total_overhead_percent = read_number(
-        run_dir,
-        (
-            "total_dmtcp_related_overhead_percent.txt",
-            "additional_overhead_percent.txt",
-        ),
+        run_dir, ("total_dmtcp_related_overhead_percent.txt",)
     )
     if (
         total_overhead_percent is None
@@ -298,11 +284,7 @@ def parse_run_directory(run_dir: Path) -> Optional[Dict[str, object]]:
         total_overhead_percent = total_overhead / baseline_reference * 100.0
 
     residual_difference = read_number(
-        run_dir,
-        (
-            "residual_dmtcp_runtime_difference_seconds.txt",
-            "residual_dmtcp_runtime_overhead_seconds.txt",
-        ),
+        run_dir, ("residual_dmtcp_runtime_difference_seconds.txt",)
     )
     if residual_difference is None and total_overhead is not None and workflow_overhead is not None:
         residual_difference = total_overhead - workflow_overhead
@@ -316,9 +298,8 @@ def parse_run_directory(run_dir: Path) -> Optional[Dict[str, object]]:
         run_dir, ("checkpoint_mean_per_rank_gib.txt",)
     )
 
-    # Baseline runs are not launched under DMTCP.  Older result directories may
-    # contain zero-valued compatibility files for checkpoint/restore metrics;
-    # expose those fields as N/A instead of presenting the zeros as measurements.
+    # Baseline runs are not launched under DMTCP, so checkpoint/restore fields
+    # are intentionally reported as N/A.
     if scenario == "baseline":
         checkpoint_seconds = None
         stabilization_seconds = None
@@ -326,8 +307,10 @@ def parse_run_directory(run_dir: Path) -> Optional[Dict[str, object]]:
         shutdown_seconds = None
         endpoint_verification_seconds = None
         final_grace_seconds = None
-        socket_cleanup_seconds = None
         restore_seconds = None
+        successful_restore_attempt_seconds = None
+        restore_attempt_count = None
+        restore_retry_count = None
         workflow_overhead = None
         total_overhead = None
         total_overhead_percent = None
@@ -355,8 +338,10 @@ def parse_run_directory(run_dir: Path) -> Optional[Dict[str, object]]:
         "original_shutdown_seconds": shutdown_seconds,
         "pre_restore_endpoint_verification_seconds": endpoint_verification_seconds,
         "pre_restore_final_grace_seconds": final_grace_seconds,
-        "socket_cleanup_seconds": socket_cleanup_seconds,
         "restore_seconds": restore_seconds,
+        "successful_restore_attempt_seconds": successful_restore_attempt_seconds,
+        "restore_attempt_count": restore_attempt_count,
+        "restore_retry_count": restore_retry_count,
         "checkpoint_restore_workflow_overhead_seconds": workflow_overhead,
         "baseline_reference_seconds": baseline_reference,
         "total_dmtcp_related_overhead_seconds": total_overhead,
@@ -502,7 +487,7 @@ def print_console_summary(
         print()
         print(
             "Target | Reps | Total (s) | Checkpoint (s) | Cleanup (s) | "
-            "Restore (s) | Workflow (s) | Total DMTCP | Residual difference | Size (GB)"
+            "Restore (s) | Attempts | Workflow (s) | Total DMTCP | Residual difference | Size (GB)"
         )
         print("-" * 160)
         for row in cr_rows:
@@ -527,6 +512,7 @@ def print_console_summary(
                 f"{format_value(row['checkpoint_seconds_mean']):>14} | "
                 f"{format_value(row['pre_restore_cleanup_seconds_mean']):>11} | "
                 f"{format_value(row['restore_seconds_mean']):>11} | "
+                f"{format_value(row['restore_attempt_count_mean'], 1):>8} | "
                 f"{format_value(row['checkpoint_restore_workflow_overhead_seconds_mean']):>12} | "
                 f"{total_summary:>19} | "
                 f"{residual_summary:>24} | "

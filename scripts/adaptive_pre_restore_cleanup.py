@@ -680,13 +680,6 @@ def write_cleanup_metrics(metrics_dir: Path, measurements: CleanupMeasurements) 
         metrics_dir / "pre_restore_final_grace_seconds.txt",
         measurements.final_grace_seconds,
     )
-    # Backward-compatible component alias. Together with
-    # original_shutdown_seconds.txt this still equals the complete adaptive
-    # cleanup duration, matching the old additive workflow calculation.
-    legacy_socket_component = (
-        measurements.endpoint_verification_seconds + measurements.final_grace_seconds
-    )
-    write_metric(metrics_dir / "socket_cleanup_sleep_seconds.txt", legacy_socket_component)
     (metrics_dir / "pre_restore_cleanup_status.txt").write_text(
         "SUCCESS\n", encoding="utf-8"
     )

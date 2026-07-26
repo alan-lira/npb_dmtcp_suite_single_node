@@ -78,23 +78,16 @@ import sys
 
 root = Path(sys.argv[1])
 benchmark, npb_class, np = sys.argv[2], sys.argv[3], int(sys.argv[4])
-patterns = (
-    f'{benchmark}{npb_class}_np{np}_baseline_rep*',
-    f'{benchmark}{npb_class}_np{np}_baseline_t*_rep*',
-)
 values = []
-seen = set()
-for pattern in patterns:
-    for run_dir in root.glob(pattern):
-        if run_dir in seen or not run_dir.is_dir():
-            continue
-        seen.add(run_dir)
-        status = run_dir / 'run_status.txt'
-        total = run_dir / 'total_seconds.txt'
-        if status.exists() and status.read_text().strip() == 'SUCCESS' and total.exists():
-            value = float(total.read_text().strip())
-            if value > 0:
-                values.append(value)
+for run_dir in root.glob(f'{benchmark}{npb_class}_np{np}_baseline_rep*'):
+    if not run_dir.is_dir():
+        continue
+    success_marker = run_dir / 'SUCCESS.marker'
+    total = run_dir / 'total_seconds.txt'
+    if success_marker.is_file() and total.is_file():
+        value = float(total.read_text().strip())
+        if value > 0:
+            values.append(value)
 if not values:
     raise SystemExit(1)
 print(f'{statistics.mean(values):.9f}')
@@ -159,8 +152,8 @@ case "${CHECKPOINT_CLEANUP_MODE}" in
 esac
 
 case "${EXISTING_RUN_POLICY}" in
-  replace|skip|error) ;;
-  *) fail "EXISTING_RUN_POLICY must be replace, skip, or error." ;;
+  resume|replace|error) ;;
+  *) fail "EXISTING_RUN_POLICY must be resume, replace, or error." ;;
 esac
 
 for positive_setting in \
@@ -175,10 +168,14 @@ done
 for nonnegative_setting in \
   PRE_RESTORE_FORCE_KILL_AFTER_SECONDS \
   PRE_RESTORE_FORCE_KILL_GRACE_SECONDS \
-  PRE_RESTORE_FINAL_GRACE_SECONDS; do
+  PRE_RESTORE_FINAL_GRACE_SECONDS \
+  RESTORE_RETRY_FINAL_GRACE_SECONDS; do
   is_nonnegative_number "${!nonnegative_setting}" \
     || fail "${nonnegative_setting} must be a nonnegative number; received '${!nonnegative_setting}'."
 done
+
+is_positive_integer "${RESTORE_MAX_ATTEMPTS}" \
+  || fail "RESTORE_MAX_ATTEMPTS must be a positive integer; received '${RESTORE_MAX_ATTEMPTS}'."
 
 [ -x "${ADAPTIVE_CLEANUP_HELPER}" ] \
   || fail "adaptive cleanup helper is missing or not executable: ${ADAPTIVE_CLEANUP_HELPER}"
@@ -288,17 +285,17 @@ RUN_DIR="${RESULTS_ROOT}/${RUN_NAME}"
 
 if [ -e "${RUN_DIR}" ]; then
   case "${EXISTING_RUN_POLICY}" in
+    resume)
+      if [ -f "${RUN_DIR}/SUCCESS.marker" ]; then
+        phase setup "Skipping successfully completed run: ${RUN_DIR}"
+        exit 0
+      fi
+      phase setup "Replacing incomplete run directory: ${RUN_DIR}"
+      rm -rf -- "${RUN_DIR}"
+      ;;
     replace)
       phase setup "Replacing existing run directory: ${RUN_DIR}"
       rm -rf -- "${RUN_DIR}"
-      ;;
-    skip)
-      if [ -f "${RUN_DIR}/run_status.txt" ] && \
-         [ "$(tr -d '[:space:]' < "${RUN_DIR}/run_status.txt")" = "SUCCESS" ]; then
-        phase setup "Skipping completed run: ${RUN_DIR}"
-        exit 0
-      fi
-      fail "run directory exists but is incomplete: ${RUN_DIR}"
       ;;
     error)
       fail "run directory already exists: ${RUN_DIR}"
@@ -309,7 +306,15 @@ fi
 mkdir -p "${RUN_DIR}"
 cd "${RUN_DIR}"
 
-# Exact runtime profile of the proven legacy runner execution.
+phase cleanup "Removing abandoned DMTCP/MPI/NPB processes before this experiment."
+if ! "${SCRIPT_DIR}/kill_dmtcp_processes.sh" > pre_run_cleanup.log 2>&1; then
+  cat pre_run_cleanup.log >&2
+  fail "pre-run process cleanup failed."
+fi
+cat pre_run_cleanup.log
+printf '%s\n' "RUNNING" > run_status.txt
+
+# Runtime profile of the validated single-node workflow.
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 export MPIR_CVAR_ENABLE_GPU="${MPIR_CVAR_ENABLE_GPU:-0}"
 export DMTCP_SIGCKPT="${DMTCP_EXPERIMENT_SIGNAL:-30}"
@@ -465,7 +470,7 @@ collect_diagnostics() {
   {
     echo "Timestamp: $(date -Is)"
     echo "Output root: ${OUTPUT_ROOT}"
-  echo "Run directory: ${RUN_DIR}"
+    echo "Run directory: ${RUN_DIR}"
     echo "Benchmark: ${BENCHMARK^^}.${NPB_CLASS}"
     echo "MPI ranks: ${NP}"
     echo "Scenario: ${SCENARIO}"
@@ -594,21 +599,14 @@ import sys
 
 root = Path(sys.argv[1])
 benchmark, npb_class, np = sys.argv[2], sys.argv[3], int(sys.argv[4])
-patterns = (
-    f'{benchmark}{npb_class}_np{np}_baseline_rep*',
-    f'{benchmark}{npb_class}_np{np}_baseline_t*_rep*',
-)
 values = []
-seen = set()
-for pattern in patterns:
-    for run_dir in root.glob(pattern):
-        if run_dir in seen or not run_dir.is_dir():
-            continue
-        seen.add(run_dir)
-        status = run_dir / 'run_status.txt'
-        total = run_dir / 'total_seconds.txt'
-        if status.exists() and status.read_text().strip() == 'SUCCESS' and total.exists():
-            values.append(float(total.read_text().strip()))
+for run_dir in root.glob(f'{benchmark}{npb_class}_np{np}_baseline_rep*'):
+    if not run_dir.is_dir():
+        continue
+    success_marker = run_dir / 'SUCCESS.marker'
+    total = run_dir / 'total_seconds.txt'
+    if success_marker.is_file() and total.is_file():
+        values.append(float(total.read_text().strip()))
 if not values:
     raise SystemExit(1)
 print(f'{statistics.mean(values):.9f}')
@@ -636,18 +634,11 @@ baseline = float(sys.argv[2])
 overhead = total - baseline
 percent = overhead / baseline * 100 if baseline else 0.0
 
-# Backward-compatible metric names.
-Path('additional_overhead_seconds.txt').write_text(f'{overhead:.9f}\n')
-Path('additional_overhead_percent.txt').write_text(f'{percent:.9f}\n')
-
-# Explicit metric names used by the execution summary.
 Path('total_dmtcp_related_overhead_seconds.txt').write_text(f'{overhead:.9f}\n')
 Path('total_dmtcp_related_overhead_percent.txt').write_text(f'{percent:.9f}\n')
 PY
   else
     echo "N/A" > baseline_reference_seconds.txt
-    echo "N/A" > additional_overhead_seconds.txt
-    echo "N/A" > additional_overhead_percent.txt
     echo "N/A" > total_dmtcp_related_overhead_seconds.txt
     echo "N/A" > total_dmtcp_related_overhead_percent.txt
   fi
@@ -662,14 +653,7 @@ def read_number(name: str) -> float:
     return float(Path(name).read_text().strip())
 
 
-if Path('pre_restore_cleanup_seconds.txt').is_file():
-    pre_restore_cleanup = read_number('pre_restore_cleanup_seconds.txt')
-else:
-    # Compatibility with result directories produced before adaptive cleanup.
-    pre_restore_cleanup = (
-        read_number('original_shutdown_seconds.txt')
-        + read_number('socket_cleanup_sleep_seconds.txt')
-    )
+pre_restore_cleanup = read_number('pre_restore_cleanup_seconds.txt')
 
 procedure_overhead = sum(
     (
@@ -682,8 +666,6 @@ procedure_overhead = sum(
 
 workflow_text = f'{procedure_overhead:.9f}\n'
 Path('checkpoint_restore_workflow_overhead_seconds.txt').write_text(workflow_text)
-# Backward-compatible alias for the previous metric name.
-Path('checkpoint_restore_procedure_overhead_seconds.txt').write_text(workflow_text)
 
 total_text = Path('total_dmtcp_related_overhead_seconds.txt').read_text().strip()
 
@@ -694,33 +676,13 @@ else:
     residual_difference = total_overhead - procedure_overhead
     residual_text = f'{residual_difference:.9f}\n'
 
-# The new name reflects that this is a signed difference.  Keep the previous
-# file as a backward-compatible alias for existing analysis scripts.
 Path('residual_dmtcp_runtime_difference_seconds.txt').write_text(residual_text)
-Path('residual_dmtcp_runtime_overhead_seconds.txt').write_text(residual_text)
 PY
 }
 
 write_execution_summary() {
-  local total checkpoint restore stabilization cleanup shutdown endpoint_verification final_grace
-  local size_total size_rank baseline procedure_overhead
-  local total_overhead total_overhead_pct residual_difference
-
+  local total
   total="$(<total_seconds.txt)"
-  checkpoint="$(<checkpoint_seconds.txt)"
-  restore="$(<dmtcp_restore_seconds.txt)"
-  stabilization="$(<post_checkpoint_stabilization_seconds.txt)"
-  cleanup="$(<pre_restore_cleanup_seconds.txt)"
-  shutdown="$(<original_shutdown_seconds.txt)"
-  endpoint_verification="$(<pre_restore_endpoint_verification_seconds.txt)"
-  final_grace="$(<pre_restore_final_grace_seconds.txt)"
-  size_total="$(<checkpoint_size_gb.txt)"
-  size_rank="$(<checkpoint_mean_per_rank_gb.txt)"
-  baseline="$(<baseline_reference_seconds.txt)"
-  procedure_overhead="$(<checkpoint_restore_workflow_overhead_seconds.txt)"
-  total_overhead="$(<total_dmtcp_related_overhead_seconds.txt)"
-  total_overhead_pct="$(<total_dmtcp_related_overhead_percent.txt)"
-  residual_difference="$(<residual_dmtcp_runtime_difference_seconds.txt)"
 
   {
     echo "Execution summary"
@@ -735,11 +697,35 @@ write_execution_summary() {
     if [ "${SCENARIO}" = "baseline" ]; then
       echo "Checkpoint/restore metrics: N/A (baseline execution; not run under DMTCP)"
     else
+      local checkpoint restore stabilization cleanup shutdown endpoint_verification final_grace
+      local restore_attempt_count restore_retry_count successful_restore_attempt
+      local size_total size_rank baseline workflow_overhead
+      local total_overhead total_overhead_pct residual_difference
+
+      checkpoint="$(<checkpoint_seconds.txt)"
+      restore="$(<dmtcp_restore_seconds.txt)"
+      restore_attempt_count="$(<restore_attempt_count.txt)"
+      restore_retry_count="$(<restore_retry_count.txt)"
+      successful_restore_attempt="$(<successful_restore_attempt_seconds.txt)"
+      stabilization="$(<post_checkpoint_stabilization_seconds.txt)"
+      cleanup="$(<pre_restore_cleanup_seconds.txt)"
+      shutdown="$(<original_shutdown_seconds.txt)"
+      endpoint_verification="$(<pre_restore_endpoint_verification_seconds.txt)"
+      final_grace="$(<pre_restore_final_grace_seconds.txt)"
+      size_total="$(<checkpoint_size_gb.txt)"
+      size_rank="$(<checkpoint_mean_per_rank_gb.txt)"
+      baseline="$(<baseline_reference_seconds.txt)"
+      workflow_overhead="$(<checkpoint_restore_workflow_overhead_seconds.txt)"
+      total_overhead="$(<total_dmtcp_related_overhead_seconds.txt)"
+      total_overhead_pct="$(<total_dmtcp_related_overhead_percent.txt)"
+      residual_difference="$(<residual_dmtcp_runtime_difference_seconds.txt)"
+
       printf 'Size of checkpoints: %.6f GB total | %.6f GB mean per application rank\n' "${size_total}" "${size_rank}"
       printf 'Time required for the checkpoint step: %.6f seconds\n' "${checkpoint}"
-      printf 'Time required for the restore step: %.6f seconds\n' "${restore}"
-      printf 'DMTCP checkpoint/restore workflow overhead: %.6f seconds\n' \
-        "${procedure_overhead}"
+      printf 'Time required for the complete restore phase: %.6f seconds (%s attempt(s), %s retry/retries)\n' \
+        "${restore}" "${restore_attempt_count}" "${restore_retry_count}"
+      printf 'Time required for the successful restore attempt: %.6f seconds\n' "${successful_restore_attempt}"
+      printf 'DMTCP checkpoint/restore workflow overhead: %.6f seconds\n' "${workflow_overhead}"
       printf '  Included phases: checkpoint %.6f + post-checkpoint stabilization %.6f + adaptive pre-restore cleanup %.6f + restore %.6f seconds\n' \
         "${checkpoint}" "${stabilization}" "${cleanup}" "${restore}"
       printf '  Adaptive cleanup detail: captured-process shutdown %.6f + endpoint verification %.6f + final verified-clear grace %.6f seconds\n' \
@@ -751,62 +737,48 @@ write_execution_summary() {
       else
         python3 - "${total_overhead}" "${total_overhead_pct}" "${baseline}" <<'PY'
 import sys
-
 value = float(sys.argv[1])
 percent = float(sys.argv[2])
 baseline = float(sys.argv[3])
 magnitude = abs(value)
 epsilon = 0.5e-6
-
 if value < -epsilon:
-    interpretation = (
-        f"complete DMTCP execution was {magnitude:.6f} seconds faster "
-        "than the baseline"
-    )
+    interpretation = f"complete DMTCP execution was {magnitude:.6f} seconds faster than the baseline"
 elif value > epsilon:
-    interpretation = (
-        f"complete DMTCP execution was {magnitude:.6f} seconds slower "
-        "than the baseline"
-    )
+    interpretation = f"complete DMTCP execution was {magnitude:.6f} seconds slower than the baseline"
 else:
     interpretation = "no measurable total difference from the baseline"
-
 print(
     f"Total DMTCP-related overhead: {value:.6f} seconds "
-    f"({percent:.3f}% compared with baseline mean {baseline:.6f} seconds; "
-    f"{interpretation})"
+    f"({percent:.3f}% compared with baseline mean {baseline:.6f} seconds; {interpretation})"
 )
 PY
-
         python3 - "${residual_difference}" <<'PY'
 import sys
-
 value = float(sys.argv[1])
 magnitude = abs(value)
 epsilon = 0.5e-6
-
 if value < -epsilon:
-    print(
-        f"Residual DMTCP runtime difference: {value:.6f} seconds "
-        f"(execution outside the checkpoint/restore workflow was "
-        f"{magnitude:.6f} seconds faster than the baseline)"
-    )
+    print(f"Residual DMTCP runtime difference: {value:.6f} seconds ({magnitude:.6f} seconds faster than baseline outside the measured checkpoint/restore workflow)")
 elif value > epsilon:
-    print(
-        f"Residual DMTCP runtime difference: {value:.6f} seconds "
-        f"(execution outside the checkpoint/restore workflow was "
-        f"{magnitude:.6f} seconds slower than the baseline)"
-    )
+    print(f"Residual DMTCP runtime difference: {value:.6f} seconds ({magnitude:.6f} seconds slower than baseline outside the measured checkpoint/restore workflow)")
 else:
-    print(
-        "Residual DMTCP runtime difference: 0.000000 seconds "
-        "(no measurable difference from the baseline outside the "
-        "checkpoint/restore workflow)"
-    )
+    print("Residual DMTCP runtime difference: 0.000000 seconds (no measurable difference outside the measured checkpoint/restore workflow)")
 PY
       fi
     fi
   } > execution_summary.txt
+}
+
+mark_success() {
+  local temporary_marker=".SUCCESS.marker.$$"
+  {
+    echo "status=SUCCESS"
+    echo "run_name=${RUN_NAME}"
+    echo "completed_at=$(date -Is)"
+    echo "npb_verification=SUCCESSFUL"
+  } > "${temporary_marker}"
+  mv -f -- "${temporary_marker}" SUCCESS.marker
 }
 
 delete_checkpoint_artifacts() {
@@ -825,21 +797,246 @@ delete_checkpoint_artifacts() {
     -exec rm -rf -- {} +
 }
 
-write_zero_cr_metrics() {
-  for file in \
-    checkpoint_command_seconds.txt checkpoint_file_wait_seconds.txt \
-    checkpoint_seconds.txt checkpoint_overhead_seconds.txt \
-    checkpoint_size_bytes.txt checkpoint_size_gb.txt checkpoint_size_gib.txt \
-    checkpoint_mean_per_rank_gb.txt checkpoint_mean_per_rank_gib.txt \
-    checkpoint_image_count.txt dmtcp_restore_seconds.txt restore_seconds.txt \
-    pre_checkpoint_runtime_seconds.txt post_checkpoint_stabilization_seconds.txt \
-    pre_restore_cleanup_seconds.txt original_shutdown_seconds.txt \
-    pre_restore_endpoint_verification_seconds.txt pre_restore_final_grace_seconds.txt \
-    socket_cleanup_sleep_seconds.txt post_dmtcp_restore_runtime_seconds.txt \
-    dmtcp_clients_before_checkpoint.txt \
-    dmtcp_clients_running_after_restore.txt dmtcp_restore_marker_found.txt; do
-    echo "0" > "${file}"
+
+copy_restore_attempt_to_canonical_logs() {
+  local attempt_dir="$1"
+
+  cp -f -- "${attempt_dir}/stdout.log" stdout_after_restore.log 2>/dev/null || true
+  cp -f -- "${attempt_dir}/stderr.log" stderr_after_restore.log 2>/dev/null || true
+  cp -f -- "${attempt_dir}/dmtcp_list_latest.txt" \
+    dmtcp_list_after_restore_latest.txt 2>/dev/null || true
+  cp -f -- "${attempt_dir}/dmtcp_list_confirmed.txt" \
+    dmtcp_list_after_restore_confirmed.txt 2>/dev/null || true
+}
+
+run_restore_attempt() {
+  local attempt_number="$1"
+  local attempt_dir="$2"
+  local attempt_start_ns
+  local attempt_end_ns
+  local restore_deadline
+  local last_restore_report
+  local bind_failure_first_seen_seconds=""
+  local bind_failure_last_count=0
+  local bind_failure_pattern='Address already in use|Bind failed'
+  local after_list total_after running_after restarting_after
+  local confirm_list total_confirm running_confirm
+  local bind_failure_count
+  local restored_status
+
+  mkdir -p "${attempt_dir}"
+  ATTEMPT_FAILURE_KIND=""
+  ATTEMPT_FAILURE_MESSAGE=""
+  RESTORE_FOUND=0
+  RUNNING_AFTER_RESTORE=0
+
+  phase restore "Attempt ${attempt_number}/${RESTORE_MAX_ATTEMPTS}: launching the generated restart script from the existing checkpoint."
+  attempt_start_ns="$(now_ns)"
+  printf '%s\n' "${attempt_start_ns}" > "${attempt_dir}/start_time_ns.txt"
+  printf '%s\n' "$(date -Is)" > "${attempt_dir}/started_at.txt"
+
+  # Do not pass coordinator options here. This remains identical to the
+  # validated single-node restart invocation.
+  bash "${RESTART_SCRIPT}" \
+    > "${attempt_dir}/stdout.log" 2> "${attempt_dir}/stderr.log" &
+  RESTORED_PID=$!
+  printf '%s\n' "${RESTORED_PID}" > "${attempt_dir}/restart_wrapper_pid.txt"
+
+  restore_deadline=$((SECONDS + DMTCP_RESTORE_TIMEOUT_SECONDS))
+  last_restore_report=$((SECONDS - RESTORE_PROGRESS_INTERVAL_SECONDS))
+
+  while pid_is_active "${RESTORED_PID}"; do
+    after_list="$(dmtcp_list)"
+    printf '%s\n' "${after_list}" > "${attempt_dir}/dmtcp_list_latest.txt"
+    total_after="$(count_regex "${after_list}" 'WorkerState::')"
+    running_after="$(count_regex "${after_list}" 'WorkerState::RUNNING')"
+    restarting_after="$(count_regex "${after_list}" 'WorkerState::RESTARTING')"
+
+    if [ "${SECONDS}" -ge $((last_restore_report + RESTORE_PROGRESS_INTERVAL_SECONDS)) ]; then
+      phase restore "Attempt ${attempt_number}/${RESTORE_MAX_ATTEMPTS}: ${running_after}/${EXPECTED_DMTCP_CLIENTS} clients RUNNING; ${restarting_after} RESTARTING; ${total_after} registered."
+      last_restore_report="${SECONDS}"
+    fi
+
+    if [ "${total_after}" -ge "${EXPECTED_DMTCP_CLIENTS}" ] && \
+       [ "${running_after}" -ge "${EXPECTED_DMTCP_CLIENTS}" ]; then
+      sleep 0.2
+      confirm_list="$(dmtcp_list)"
+      printf '%s\n' "${confirm_list}" > "${attempt_dir}/dmtcp_list_confirmed.txt"
+      total_confirm="$(count_regex "${confirm_list}" 'WorkerState::')"
+      running_confirm="$(count_regex "${confirm_list}" 'WorkerState::RUNNING')"
+      if [ "${total_confirm}" -ge "${EXPECTED_DMTCP_CLIENTS}" ] && \
+         [ "${running_confirm}" -ge "${EXPECTED_DMTCP_CLIENTS}" ]; then
+        RESTORE_FOUND=1
+        RUNNING_AFTER_RESTORE="${running_confirm}"
+        break
+      fi
+    fi
+
+    bind_failure_count="$(grep -Eic "${bind_failure_pattern}" "${attempt_dir}/stderr.log" 2>/dev/null || true)"
+    if [ "${bind_failure_count}" -gt 0 ]; then
+      if [ -z "${bind_failure_first_seen_seconds}" ]; then
+        bind_failure_first_seen_seconds="${SECONDS}"
+        phase restore "Attempt ${attempt_number}/${RESTORE_MAX_ATTEMPTS}: detected bind-related errors; allowing ${RESTORE_BIND_FAILURE_ABORT_SECONDS}s for transient recovery."
+      fi
+      if [ "${bind_failure_count}" -ne "${bind_failure_last_count}" ]; then
+        printf '%s\n' "${bind_failure_count}" > "${attempt_dir}/bind_failure_count.txt"
+        bind_failure_last_count="${bind_failure_count}"
+      fi
+      if python3 - "${SECONDS}" "${bind_failure_first_seen_seconds}" "${RESTORE_BIND_FAILURE_ABORT_SECONDS}" <<'PY'
+import sys
+now, first, threshold = map(float, sys.argv[1:])
+raise SystemExit(0 if now - first >= threshold else 1)
+PY
+      then
+        {
+          echo "First detected at shell elapsed second: ${bind_failure_first_seen_seconds}"
+          echo "Aborted at shell elapsed second: ${SECONDS}"
+          echo "Configured persistence threshold: ${RESTORE_BIND_FAILURE_ABORT_SECONDS}"
+          echo "Matching stderr lines: ${bind_failure_count}"
+          grep -Ein "${bind_failure_pattern}" "${attempt_dir}/stderr.log" 2>/dev/null || true
+        } > "${attempt_dir}/persistent_bind_failure.txt"
+        ATTEMPT_FAILURE_KIND="persistent_bind_failure"
+        ATTEMPT_FAILURE_MESSAGE="persistent bind/address-in-use errors"
+        break
+      fi
+    fi
+
+    if [ "${SECONDS}" -ge "${restore_deadline}" ]; then
+      ATTEMPT_FAILURE_KIND="timeout"
+      ATTEMPT_FAILURE_MESSAGE="did not reach ${EXPECTED_DMTCP_CLIENTS} RUNNING clients within ${DMTCP_RESTORE_TIMEOUT_SECONDS} seconds"
+      break
+    fi
+    sleep 0.2
   done
+
+  if [ "${RESTORE_FOUND}" -eq 1 ]; then
+    attempt_end_ns="$(now_ns)"
+    write_elapsed "${attempt_dir}/duration_seconds.txt" "${attempt_start_ns}" "${attempt_end_ns}"
+    printf '%s\n' "SUCCESS" > "${attempt_dir}/status.txt"
+    printf '%s\n' "all expected clients reached RUNNING" > "${attempt_dir}/reason.txt"
+    copy_restore_attempt_to_canonical_logs "${attempt_dir}"
+    printf '%s\tSUCCESS\t%s\t%s\n' \
+      "${attempt_number}" \
+      "$(<"${attempt_dir}/duration_seconds.txt")" \
+      "all_expected_clients_running" \
+      >> restore_attempts_summary.tsv
+    return 0
+  fi
+
+  if [ -z "${ATTEMPT_FAILURE_KIND}" ]; then
+    set +e
+    wait "${RESTORED_PID}"
+    restored_status=$?
+    set -e
+    RESTORED_PID=""
+    ATTEMPT_FAILURE_KIND="restart_script_exited"
+    ATTEMPT_FAILURE_MESSAGE="restart script exited with status ${restored_status} before all clients were RUNNING"
+    printf '%s\n' "${restored_status}" > "${attempt_dir}/restart_wrapper_exit_status.txt"
+  fi
+
+  attempt_end_ns="$(now_ns)"
+  write_elapsed "${attempt_dir}/duration_seconds.txt" "${attempt_start_ns}" "${attempt_end_ns}"
+  printf '%s\n' "FAILED" > "${attempt_dir}/status.txt"
+  printf '%s\n' "${ATTEMPT_FAILURE_KIND}" > "${attempt_dir}/failure_kind.txt"
+  printf '%s\n' "${ATTEMPT_FAILURE_MESSAGE}" > "${attempt_dir}/reason.txt"
+  copy_restore_attempt_to_canonical_logs "${attempt_dir}"
+  collect_diagnostics "${attempt_dir}/${ATTEMPT_FAILURE_KIND}"
+  printf '%s\tFAILED\t%s\t%s\n' \
+    "${attempt_number}" \
+    "$(<"${attempt_dir}/duration_seconds.txt")" \
+    "${ATTEMPT_FAILURE_KIND}" \
+    >> restore_attempts_summary.tsv
+  return 1
+}
+
+cleanup_failed_restore_attempt() {
+  local attempt_number="$1"
+  local attempt_dir="$2"
+  local retry_cleanup_dir="${attempt_dir}/retry_cleanup"
+  local cleanup_state="${retry_cleanup_dir}/captured_state.json"
+  local capture_status=1
+  local adaptive_status=1
+  local wrapper_status=0
+
+  mkdir -p "${retry_cleanup_dir}"
+  phase cleanup "Cleaning failed restore attempt ${attempt_number}/${RESTORE_MAX_ATTEMPTS} before reusing the same checkpoint."
+
+  if [ -n "${RESTORED_PID}" ] && pid_is_active "${RESTORED_PID}"; then
+    set +e
+    python3 "${ADAPTIVE_CLEANUP_HELPER}" capture \
+      --root-pid "${RESTORED_PID}" \
+      --state "${cleanup_state}" \
+      --process-report "${retry_cleanup_dir}/captured_processes.tsv" \
+      --socket-report "${retry_cleanup_dir}/captured_sockets.tsv" \
+      > "${retry_cleanup_dir}/capture.log" 2>&1
+    capture_status=$?
+    set -e
+  else
+    printf '%s\n' "Restart wrapper was no longer active at retry cleanup." \
+      > "${retry_cleanup_dir}/capture.log"
+  fi
+
+  if [ -n "${PORT}" ]; then
+    dmtcp_command --coord-port "${PORT}" --kill >/dev/null 2>&1 || true
+  fi
+
+  if [ "${capture_status}" -eq 0 ]; then
+    set +e
+    python3 "${ADAPTIVE_CLEANUP_HELPER}" cleanup \
+      --state "${cleanup_state}" \
+      --metrics-dir "${retry_cleanup_dir}" \
+      --timeout "${PRE_RESTORE_CLEANUP_TIMEOUT_SECONDS}" \
+      --poll "${PRE_RESTORE_CLEANUP_POLL_SECONDS}" \
+      --force-kill-after "${PRE_RESTORE_FORCE_KILL_AFTER_SECONDS}" \
+      --force-kill-grace "${PRE_RESTORE_FORCE_KILL_GRACE_SECONDS}" \
+      --final-grace "0" \
+      --report-interval "${PRE_RESTORE_CLEANUP_REPORT_INTERVAL_SECONDS}" \
+      > "${retry_cleanup_dir}/adaptive_cleanup.log" 2>&1
+    adaptive_status=$?
+    set -e
+    cat "${retry_cleanup_dir}/adaptive_cleanup.log"
+  else
+    phase cleanup "Could not capture the failed restore process tree exactly; using emergency process cleanup and explicit retry grace."
+  fi
+
+  if [ -n "${RESTORED_PID}" ]; then
+    terminate_process_tree "${RESTORED_PID}" TERM
+    sleep 1
+    terminate_process_tree "${RESTORED_PID}" KILL
+    set +e
+    wait "${RESTORED_PID}"
+    wrapper_status=$?
+    set -e
+    printf '%s\n' "${wrapper_status}" > "${retry_cleanup_dir}/restart_wrapper_exit_status.txt"
+    RESTORED_PID=""
+  fi
+
+  if ! "${SCRIPT_DIR}/kill_dmtcp_processes.sh" \
+      > "${retry_cleanup_dir}/emergency_process_cleanup.log" 2>&1; then
+    cat "${retry_cleanup_dir}/emergency_process_cleanup.log" >&2
+    return 1
+  fi
+
+  if [ "${capture_status}" -eq 0 ] && [ "${adaptive_status}" -ne 0 ]; then
+    return 1
+  fi
+
+  if python3 - "${RESTORE_RETRY_FINAL_GRACE_SECONDS}" <<'PY'
+import sys
+raise SystemExit(0 if float(sys.argv[1]) > 0 else 1)
+PY
+  then
+    phase cleanup "Applying final retry grace of ${RESTORE_RETRY_FINAL_GRACE_SECONDS} seconds after cleanup verification."
+    sleep "${RESTORE_RETRY_FINAL_GRACE_SECONDS}"
+  fi
+
+  if [ "${capture_status}" -eq 0 ]; then
+    printf '%s\n' "adaptive_endpoint_cleanup_plus_emergency_sweep" \
+      > "${retry_cleanup_dir}/cleanup_mode.txt"
+  else
+    printf '%s\n' "fallback_process_cleanup" > "${retry_cleanup_dir}/cleanup_mode.txt"
+  fi
+  return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -863,6 +1060,9 @@ write_zero_cr_metrics() {
   echo "Binary: ${NPB_BIN}"
   echo "DMTCP commit: ${DMTCP_COMMIT:-unknown}"
   echo "DMTCP restore listener backlog: ${DMTCP_RESTORE_LISTEN_BACKLOG:-unknown}"
+  echo "DMTCP duplex stream refill patch: ${DMTCP_DUPLEX_REFILL_PATCH_ACTIVE:-unknown}"
+  echo "DMTCP IPC plugin: ${DMTCP_IPC_PLUGIN_PATH:-unknown}"
+  echo "DMTCP IPC plugin SHA256: ${DMTCP_IPC_PLUGIN_SHA256:-unknown}"
   echo "Kernel net.core.somaxconn: $(cat /proc/sys/net/core/somaxconn)"
   echo "DMTCP signal: ${DMTCP_SIGCKPT}"
   echo "MPICH version: ${MPICH_VERSION:-unknown}"
@@ -876,6 +1076,8 @@ write_zero_cr_metrics() {
   echo "Pre-restore force KILL grace seconds: ${PRE_RESTORE_FORCE_KILL_GRACE_SECONDS}"
   echo "Pre-restore final grace seconds: ${PRE_RESTORE_FINAL_GRACE_SECONDS}"
   echo "Restore bind-failure abort seconds: ${RESTORE_BIND_FAILURE_ABORT_SECONDS}"
+  echo "Restore maximum attempts: ${RESTORE_MAX_ATTEMPTS}"
+  echo "Restore retry final verified-clear grace seconds: ${RESTORE_RETRY_FINAL_GRACE_SECONDS}"
 } > run_metadata.txt
 
 printf '%s\n' "${CHECKPOINT_MODE}" > checkpoint_mode.txt
@@ -900,6 +1102,7 @@ if [ "${SCENARIO}" = "cr" ]; then
     printf '%s\n' "Checkpoint target: ${CHECKPOINT_DELAY_SECONDS} seconds after launch (direct delay)"
   fi
   printf '%s\n' "Checkpoint cleanup: ${CHECKPOINT_CLEANUP_MODE}"
+  printf '%s\n' "Restore attempts: ${RESTORE_MAX_ATTEMPTS} maximum from the same checkpoint"
 fi
 printf '%s\n' "DMTCP signal: ${DMTCP_SIGCKPT}"
 printf '%s\n' "============================================================"
@@ -927,7 +1130,6 @@ if [ "${SCENARIO}" = "baseline" ]; then
 
   TOTAL_END_NS="$(now_ns)"
   write_elapsed total_seconds.txt "${TOTAL_START_NS}" "${TOTAL_END_NS}"
-  cp total_seconds.txt total_wall_seconds.txt
 
   if [ "${APP_STATUS}" -ne 0 ]; then
     echo "FAILED" > run_status.txt
@@ -942,11 +1144,10 @@ if [ "${SCENARIO}" = "baseline" ]; then
   fi
 
   echo "1" > npb_verification_successful.txt
-  write_zero_cr_metrics
-  write_overhead_metrics "$(<total_seconds.txt)"
-  write_checkpoint_restore_overhead_metrics
+  cp total_seconds.txt baseline_reference_seconds.txt
   write_execution_summary
   echo "SUCCESS" > run_status.txt
+  mark_success
 
   phase baseline "Completed successfully in $(human_seconds "$(<total_seconds.txt)")."
   echo
@@ -958,7 +1159,7 @@ if [ "${SCENARIO}" = "baseline" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Checkpoint/restart execution: preserve the proven legacy runner order.
+# Checkpoint/restart execution: preserve the validated single-node runner order.
 # ---------------------------------------------------------------------------
 PORT="${DMTCP_COORD_PORT:-$(select_random_port)}"
 echo "${PORT}" > dmtcp_coord_port.txt
@@ -1050,7 +1251,6 @@ CKPT_END_NS="$(now_ns)"
 CKPT_WAIT_END_NS="${CKPT_END_NS}"
 write_elapsed checkpoint_file_wait_seconds.txt "${CKPT_WAIT_START_NS}" "${CKPT_WAIT_END_NS}"
 write_elapsed checkpoint_seconds.txt "${CKPT_START_NS}" "${CKPT_END_NS}"
-cp checkpoint_seconds.txt checkpoint_overhead_seconds.txt
 echo "${CKPT_COUNT}" > checkpoint_image_count.txt
 checkpoint_storage_metrics
 
@@ -1139,106 +1339,67 @@ chmod +x "${RESTART_SCRIPT}"
 RESTORE_START_NS="$(now_ns)"
 phase restore "Restoring checkpoints using script: ${RESTART_SCRIPT_ABS}"
 phase restore "The generated script will launch a new coordinator and restore ${EXPECTED_DMTCP_CLIENTS} DMTCP clients."
+phase restore "Up to ${RESTORE_MAX_ATTEMPTS} attempts will reuse this same checkpoint if a restore attempt stalls or exits before RUNNING."
 
-# Do not pass coordinator options here.  This is intentionally identical to
-# the proven legacy runner behavior.
-bash "${RESTART_SCRIPT}" \
-  > stdout_after_restore.log 2> stderr_after_restore.log &
-RESTORED_PID=$!
-
-RESTORE_DEADLINE=$((SECONDS + DMTCP_RESTORE_TIMEOUT_SECONDS))
-LAST_RESTORE_REPORT=$((SECONDS - RESTORE_PROGRESS_INTERVAL_SECONDS))
+mkdir -p restore_attempts
+printf 'attempt\tstatus\tduration_seconds\treason\n' > restore_attempts_summary.tsv
 RESTORE_FOUND=0
-RUNNING_AFTER_RESTORE=0
-BIND_FAILURE_FIRST_SEEN_SECONDS=""
-BIND_FAILURE_LAST_COUNT=0
-BIND_FAILURE_PATTERN='Address already in use|Bind failed'
+SUCCESSFUL_RESTORE_ATTEMPT=0
+RESTORE_ATTEMPTS_EXECUTED=0
+ATTEMPT_FAILURE_KIND=""
+ATTEMPT_FAILURE_MESSAGE=""
 
-while pid_is_active "${RESTORED_PID}"; do
-  AFTER_LIST="$(dmtcp_list)"
-  printf '%s\n' "${AFTER_LIST}" > dmtcp_list_after_restore_latest.txt
-  TOTAL_AFTER="$(count_regex "${AFTER_LIST}" 'WorkerState::')"
-  RUNNING_AFTER="$(count_regex "${AFTER_LIST}" 'WorkerState::RUNNING')"
-  RESTARTING_AFTER="$(count_regex "${AFTER_LIST}" 'WorkerState::RESTARTING')"
+for (( RESTORE_ATTEMPT=1; RESTORE_ATTEMPT<=RESTORE_MAX_ATTEMPTS; RESTORE_ATTEMPT++ )); do
+  ATTEMPT_DIR="restore_attempts/attempt_$(printf '%02d' "${RESTORE_ATTEMPT}")"
+  RESTORE_ATTEMPTS_EXECUTED="${RESTORE_ATTEMPT}"
 
-  if [ "${SECONDS}" -ge $((LAST_RESTORE_REPORT + RESTORE_PROGRESS_INTERVAL_SECONDS)) ]; then
-    phase restore "Progress: ${RUNNING_AFTER}/${EXPECTED_DMTCP_CLIENTS} clients RUNNING; ${RESTARTING_AFTER} RESTARTING; ${TOTAL_AFTER} registered."
-    LAST_RESTORE_REPORT="${SECONDS}"
+  if run_restore_attempt "${RESTORE_ATTEMPT}" "${ATTEMPT_DIR}"; then
+    SUCCESSFUL_RESTORE_ATTEMPT="${RESTORE_ATTEMPT}"
+    break
   fi
 
-  if [ "${TOTAL_AFTER}" -ge "${EXPECTED_DMTCP_CLIENTS}" ] && \
-     [ "${RUNNING_AFTER}" -ge "${EXPECTED_DMTCP_CLIENTS}" ]; then
-    sleep 0.2
-    CONFIRM_LIST="$(dmtcp_list)"
-    printf '%s\n' "${CONFIRM_LIST}" > dmtcp_list_after_restore_confirmed.txt
-    TOTAL_CONFIRM="$(count_regex "${CONFIRM_LIST}" 'WorkerState::')"
-    RUNNING_CONFIRM="$(count_regex "${CONFIRM_LIST}" 'WorkerState::RUNNING')"
-    if [ "${TOTAL_CONFIRM}" -ge "${EXPECTED_DMTCP_CLIENTS}" ] && \
-       [ "${RUNNING_CONFIRM}" -ge "${EXPECTED_DMTCP_CLIENTS}" ]; then
-      RESTORE_FOUND=1
-      RUNNING_AFTER_RESTORE="${RUNNING_CONFIRM}"
-      break
-    fi
-  fi
+  phase restore "Attempt ${RESTORE_ATTEMPT}/${RESTORE_MAX_ATTEMPTS} failed: ${ATTEMPT_FAILURE_MESSAGE}."
 
-  BIND_FAILURE_COUNT="$(grep -Eic "${BIND_FAILURE_PATTERN}" stderr_after_restore.log 2>/dev/null || true)"
-  if [ "${BIND_FAILURE_COUNT}" -gt 0 ]; then
-    if [ -z "${BIND_FAILURE_FIRST_SEEN_SECONDS}" ]; then
-      BIND_FAILURE_FIRST_SEEN_SECONDS="${SECONDS}"
-      phase restore "Detected bind-related errors in stderr_after_restore.log; allowing ${RESTORE_BIND_FAILURE_ABORT_SECONDS}s for transient recovery."
-    fi
-    if [ "${BIND_FAILURE_COUNT}" -ne "${BIND_FAILURE_LAST_COUNT}" ]; then
-      printf '%s\n' "${BIND_FAILURE_COUNT}" > restore_bind_failure_count.txt
-      BIND_FAILURE_LAST_COUNT="${BIND_FAILURE_COUNT}"
-    fi
-    if python3 - "${SECONDS}" "${BIND_FAILURE_FIRST_SEEN_SECONDS}" "${RESTORE_BIND_FAILURE_ABORT_SECONDS}" <<'PY'
-import sys
-now, first, threshold = map(float, sys.argv[1:])
-raise SystemExit(0 if now - first >= threshold else 1)
-PY
-    then
-      {
-        echo "First detected at shell elapsed second: ${BIND_FAILURE_FIRST_SEEN_SECONDS}"
-        echo "Aborted at shell elapsed second: ${SECONDS}"
-        echo "Configured persistence threshold: ${RESTORE_BIND_FAILURE_ABORT_SECONDS}"
-        echo "Matching stderr lines: ${BIND_FAILURE_COUNT}"
-        grep -Ein "${BIND_FAILURE_PATTERN}" stderr_after_restore.log 2>/dev/null || true
-      } > restore_bind_failure_detected.txt
-      echo "0" > dmtcp_restore_marker_found.txt
-      echo "FAILED" > run_status.txt
-      collect_diagnostics restore_persistent_bind_failure
-      fail "persistent bind/address-in-use errors were detected during restore; aborted before the full restore timeout."
-    fi
-  fi
-
-  if [ "${SECONDS}" -ge "${RESTORE_DEADLINE}" ]; then
+  if ! cleanup_failed_restore_attempt "${RESTORE_ATTEMPT}" "${ATTEMPT_DIR}"; then
     echo "0" > dmtcp_restore_marker_found.txt
     echo "FAILED" > run_status.txt
-    collect_diagnostics restore_timeout
-    fail "restore did not reach ${EXPECTED_DMTCP_CLIENTS} RUNNING clients within ${DMTCP_RESTORE_TIMEOUT_SECONDS} seconds."
+    fail "failed restore attempt ${RESTORE_ATTEMPT} could not be cleaned safely; no further attempt was launched."
   fi
-  sleep 0.2
+
+  if [ "${RESTORE_ATTEMPT}" -lt "${RESTORE_MAX_ATTEMPTS}" ]; then
+    CURRENT_CKPT_COUNT="$(find . -maxdepth 1 -type f -name 'ckpt_*.dmtcp' | wc -l)"
+    if [ "${CURRENT_CKPT_COUNT}" -lt "${EXPECTED_DMTCP_CLIENTS}" ] || \
+       [ ! -f "${RESTART_SCRIPT}" ]; then
+      echo "0" > dmtcp_restore_marker_found.txt
+      echo "FAILED" > run_status.txt
+      fail "checkpoint artifacts are incomplete after failed restore attempt ${RESTORE_ATTEMPT}; retry is unsafe."
+    fi
+    echo "RETRYING_RESTORE" > run_status.txt
+    phase restore "Retrying from the same ${CURRENT_CKPT_COUNT} checkpoint images after verified cleanup."
+  fi
 done
 
-if [ "${RESTORE_FOUND}" -ne 1 ]; then
-  set +e
-  wait "${RESTORED_PID}"
-  RESTORED_STATUS=$?
-  set -e
-  RESTORED_PID=""
+printf '%s\n' "${SUCCESSFUL_RESTORE_ATTEMPT}" > restore_attempt_count.txt
+printf '%s\n' "$((SUCCESSFUL_RESTORE_ATTEMPT > 0 ? SUCCESSFUL_RESTORE_ATTEMPT - 1 : RESTORE_MAX_ATTEMPTS - 1))" \
+  > restore_retry_count.txt
+
+if [ "${RESTORE_FOUND}" -ne 1 ] || [ "${SUCCESSFUL_RESTORE_ATTEMPT}" -le 0 ]; then
   echo "0" > dmtcp_restore_marker_found.txt
   echo "FAILED" > run_status.txt
-  collect_diagnostics restore_exited_before_running
-  fail "restart script exited with status ${RESTORED_STATUS} before all clients were RUNNING."
+  fail "all ${RESTORE_MAX_ATTEMPTS} restore attempts failed; checkpoint images and per-attempt diagnostics were preserved."
 fi
 
 RESTORE_END_NS="$(now_ns)"
 write_elapsed dmtcp_restore_seconds.txt "${RESTORE_START_NS}" "${RESTORE_END_NS}"
-cp dmtcp_restore_seconds.txt restore_seconds.txt
+SUCCESSFUL_ATTEMPT_DIR="restore_attempts/attempt_$(printf '%02d' "${SUCCESSFUL_RESTORE_ATTEMPT}")"
+cp -f -- \
+  "${SUCCESSFUL_ATTEMPT_DIR}/duration_seconds.txt" \
+  successful_restore_attempt_seconds.txt
+
 echo "1" > dmtcp_restore_marker_found.txt
 echo "${RUNNING_AFTER_RESTORE}" > dmtcp_clients_running_after_restore.txt
-phase restore "Restore complete: ${RUNNING_AFTER_RESTORE}/${EXPECTED_DMTCP_CLIENTS} DMTCP clients are RUNNING."
-phase restore "Restore step took $(human_seconds "$(<dmtcp_restore_seconds.txt)")."
+phase restore "Restore complete on attempt ${SUCCESSFUL_RESTORE_ATTEMPT}/${RESTORE_MAX_ATTEMPTS}: ${RUNNING_AFTER_RESTORE}/${EXPECTED_DMTCP_CLIENTS} DMTCP clients are RUNNING."
+phase restore "Successful attempt took $(human_seconds "$(<successful_restore_attempt_seconds.txt)"); total restore phase including failed attempts and retry cleanup took $(human_seconds "$(<dmtcp_restore_seconds.txt)")."
 phase run "Restored ${BENCHMARK^^}.${NPB_CLASS} computation is continuing."
 
 POST_RESTORE_START_NS="${RESTORE_END_NS}"
@@ -1253,6 +1414,12 @@ set +e
 wait "${RESTORED_PID}"
 RESTORED_STATUS=$?
 set -e
+
+# The first canonical-log copy was taken when every DMTCP client reached
+# RUNNING. Refresh it after the restored application exits so NPB verification,
+# timing, and final benchmark output are read from the complete attempt logs.
+copy_restore_attempt_to_canonical_logs "${SUCCESSFUL_ATTEMPT_DIR}"
+
 RESTORED_PID=""
 RESTORE_COMPLETION_NS="$(now_ns)"
 write_elapsed post_dmtcp_restore_runtime_seconds.txt "${POST_RESTORE_START_NS}" "${RESTORE_COMPLETION_NS}"
@@ -1265,7 +1432,6 @@ fi
 
 TOTAL_END_NS="$(now_ns)"
 write_elapsed total_seconds.txt "${TOTAL_START_NS}" "${TOTAL_END_NS}"
-cp total_seconds.txt total_wall_seconds.txt
 
 if ! verify_npb_output stdout_before_ckpt.log stdout_after_restore.log; then
   echo "0" > npb_verification_successful.txt
@@ -1280,6 +1446,7 @@ write_checkpoint_restore_overhead_metrics
 write_execution_summary
 delete_checkpoint_artifacts
 echo "SUCCESS" > run_status.txt
+mark_success
 
 phase complete "NPB verification was SUCCESSFUL."
 phase complete "All metrics were written to ${RUN_DIR}."

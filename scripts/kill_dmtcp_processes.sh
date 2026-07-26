@@ -44,4 +44,8 @@ sleep 1
 
 echo
 echo "Remaining matching processes:"
-pgrep -a -u "${CURRENT_USER}" -f "${PROCESS_PATTERN}" || echo "None"
+if pgrep -a -u "${CURRENT_USER}" -f "${PROCESS_PATTERN}"; then
+  echo "ERROR: Matching DMTCP/MPI/NPB processes remain after cleanup." >&2
+  exit 1
+fi
+echo "None"

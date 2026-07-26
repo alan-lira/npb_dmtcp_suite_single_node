@@ -22,7 +22,6 @@ from typing import Dict
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent.parent.joinpath("scripts")
-print(SCRIPT_DIR)
 HELPER = SCRIPT_DIR / "adaptive_pre_restore_cleanup.py"
 
 

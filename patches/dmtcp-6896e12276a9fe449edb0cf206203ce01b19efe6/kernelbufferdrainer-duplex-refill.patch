@@ -1,0 +1,362 @@
+diff -uNr a/src/plugin/ipc/socket/kernelbufferdrainer.cpp b/src/plugin/ipc/socket/kernelbufferdrainer.cpp
+--- a/src/plugin/ipc/socket/kernelbufferdrainer.cpp	2026-07-26 23:13:18.317052784 +0000
++++ b/src/plugin/ipc/socket/kernelbufferdrainer.cpp	2026-07-26 23:13:18.317052784 +0000
+@@ -26,6 +26,8 @@
+ #include "connectionmessage.h"
+ #include "socketwrappers.h"
+ #include "util.h"
++#include <errno.h>
++#include <poll.h>
+ #include <sys/ioctl.h>
+ #include <sys/socket.h>
+ 
+@@ -290,59 +292,310 @@
+ {
+   JTRACE("refilling socket buffers") (_drainedData.size());
+ 
+-  // write all buffers out (stream sockets only)
++  // Refill stream sockets using a nonblocking duplex state machine.
++  //
++  // The previous implementation wrote every complete saved buffer before it
++  // started reading any peer buffer.  When both endpoints had large saved
++  // buffers, both sides could block in writeAll() before either side reached
++  // the read phase.  Transfer headers, payloads, and echoes incrementally
++  // across all stream sockets instead.
++  struct StreamRefillState
++  {
++    int fd;
++
++    ConnMsg outgoingMsg;
++    size_t outgoingMsgOffset;
++
++    vector<char> *outgoingData;
++    size_t outgoingDataOffset;
++
++    ConnMsg incomingMsg;
++    size_t incomingMsgOffset;
++    bool incomingMsgReady;
++
++    vector<char> incomingData;
++    size_t incomingDataOffset;
++
++    size_t echoOffset;
++
++    StreamRefillState(int socketFd, vector<char> *data)
++      : fd(socketFd),
++        outgoingMsg(ConnMsg::REFILL),
++        outgoingMsgOffset(0),
++        outgoingData(data),
++        outgoingDataOffset(0),
++        incomingMsg(),
++        incomingMsgOffset(0),
++        incomingMsgReady(false),
++        incomingData(),
++        incomingDataOffset(0),
++        echoOffset(0)
++    {
++      JASSERT(data->size() <= 0x7fffffffUL)
++        (socketFd) (data->size())
++        .Text("refill buffer is too large for ConnMsg::extraBytes");
++
++      outgoingMsg.extraBytes = static_cast<int>(data->size());
++      incomingMsg.poison();
++    }
++
++    bool outgoingComplete() const
++    {
++      return outgoingMsgOffset == sizeof(ConnMsg) &&
++             outgoingDataOffset == outgoingData->size();
++    }
++
++    bool incomingComplete() const
++    {
++      return incomingMsgReady &&
++             incomingDataOffset == incomingData.size();
++    }
++
++    bool echoComplete() const
++    {
++      return incomingComplete() && echoOffset == incomingData.size();
++    }
++
++    bool done() const
++    {
++      return outgoingComplete() && incomingComplete() && echoComplete();
++    }
++  };
++
+   map<int, vector<char> >::iterator i;
++  vector<StreamRefillState> streamStates;
++
+   for (i = _drainedData.begin(); i != _drainedData.end(); ++i) {
+     int fd = i->first;
+     if (_isSeqpacket[fd]) {
+       continue;
+     }
+-    int size = i->second.size();
+-    JWARNING(size >= 0) (size).Text("a failed drain is in our table???");
+-    if (size < 0) {
+-      size = 0;
+-    }
+ 
+-    // Double the send buffer
++    // Preserve the original temporary send-buffer scaling.
+     scaleSendBuffers(fd, 2);
+-    ConnMsg msg(ConnMsg::REFILL);
+-    msg.extraBytes = size;
+-    jalib::JSocket sock(fd);
+-    if (size > 0) {
+-      JTRACE("requesting repeat buffer...") (sock.sockfd()) (size);
+-    }
+-    sock << msg;
+-    if (size > 0) {
+-      sock.writeAll(&i->second[0], size);
+-    }
+-    i->second.clear();
++    streamStates.push_back(StreamRefillState(fd, &i->second));
+   }
+ 
+-  // JTRACE("repeating our friends buffers...");
++  size_t unfinished = streamStates.size();
+ 
+-  // read all buffers in
+-  for (i = _drainedData.begin(); i != _drainedData.end(); ++i) {
+-    int fd = i->first;
+-    if (_isSeqpacket[fd]) {
+-      continue;
++  while (unfinished > 0) {
++    bool madeProgress = false;
++    unfinished = 0;
++
++    for (size_t index = 0; index < streamStates.size(); ++index) {
++      StreamRefillState &state = streamStates[index];
++
++      if (state.done()) {
++        continue;
++      }
++
++      // Receive the peer's REFILL header.
++      if (!state.incomingMsgReady) {
++        char *destination =
++          reinterpret_cast<char *>(&state.incomingMsg) +
++          state.incomingMsgOffset;
++        size_t remaining = sizeof(ConnMsg) - state.incomingMsgOffset;
++
++        ssize_t count = ::recv(state.fd,
++                               destination,
++                               remaining,
++                               MSG_DONTWAIT);
++
++        if (count > 0) {
++          state.incomingMsgOffset += static_cast<size_t>(count);
++          madeProgress = true;
++
++          if (state.incomingMsgOffset == sizeof(ConnMsg)) {
++            state.incomingMsg.assertValid(ConnMsg::REFILL);
++            JASSERT(state.incomingMsg.extraBytes >= 0)
++              (state.fd) (state.incomingMsg.extraBytes)
++              .Text("negative stream-refill payload size");
++
++            state.incomingData.resize(
++              static_cast<size_t>(state.incomingMsg.extraBytes));
++            state.incomingMsgReady = true;
++          }
++        } else if (count == 0) {
++          JASSERT(false)
++            (state.fd)
++            .Text("peer closed during stream-refill header receive");
++        } else if (errno != EAGAIN &&
++                   errno != EWOULDBLOCK &&
++                   errno != EINTR) {
++          JASSERT(false)
++            (state.fd) (JASSERT_ERRNO)
++            .Text("stream-refill header receive failed");
++        }
++      }
++
++      // Receive the peer's saved payload.
++      if (state.incomingMsgReady &&
++          state.incomingDataOffset < state.incomingData.size()) {
++        char *destination = &state.incomingData[state.incomingDataOffset];
++        size_t remaining =
++          state.incomingData.size() - state.incomingDataOffset;
++
++        ssize_t count = ::recv(state.fd,
++                               destination,
++                               remaining,
++                               MSG_DONTWAIT);
++
++        if (count > 0) {
++          state.incomingDataOffset += static_cast<size_t>(count);
++          madeProgress = true;
++        } else if (count == 0) {
++          JASSERT(false)
++            (state.fd)
++            .Text("peer closed during stream-refill payload receive");
++        } else if (errno != EAGAIN &&
++                   errno != EWOULDBLOCK &&
++                   errno != EINTR) {
++          JASSERT(false)
++            (state.fd) (JASSERT_ERRNO)
++            .Text("stream-refill payload receive failed");
++        }
++      }
++
++      // Send our REFILL header.
++      if (state.outgoingMsgOffset < sizeof(ConnMsg)) {
++        const char *source =
++          reinterpret_cast<const char *>(&state.outgoingMsg) +
++          state.outgoingMsgOffset;
++        size_t remaining = sizeof(ConnMsg) - state.outgoingMsgOffset;
++
++        ssize_t count = ::send(state.fd,
++                               source,
++                               remaining,
++                               MSG_DONTWAIT | MSG_NOSIGNAL);
++
++        if (count > 0) {
++          state.outgoingMsgOffset += static_cast<size_t>(count);
++          madeProgress = true;
++        } else if (count < 0 &&
++                   errno != EAGAIN &&
++                   errno != EWOULDBLOCK &&
++                   errno != EINTR) {
++          JASSERT(false)
++            (state.fd) (JASSERT_ERRNO)
++            .Text("stream-refill header send failed");
++        }
++      }
++
++      // Send our saved payload after our header.
++      if (state.outgoingMsgOffset == sizeof(ConnMsg) &&
++          state.outgoingDataOffset < state.outgoingData->size()) {
++        const char *source =
++          &(*state.outgoingData)[state.outgoingDataOffset];
++        size_t remaining =
++          state.outgoingData->size() - state.outgoingDataOffset;
++
++        ssize_t count = ::send(state.fd,
++                               source,
++                               remaining,
++                               MSG_DONTWAIT | MSG_NOSIGNAL);
++
++        if (count > 0) {
++          state.outgoingDataOffset += static_cast<size_t>(count);
++          madeProgress = true;
++        } else if (count < 0 &&
++                   errno != EAGAIN &&
++                   errno != EWOULDBLOCK &&
++                   errno != EINTR) {
++          JASSERT(false)
++            (state.fd) (JASSERT_ERRNO)
++            .Text("stream-refill payload send failed");
++        }
++      }
++
++      // Echo the peer payload only after our complete REFILL frame has been
++      // sent.  This preserves stream ordering: our header and payload must
++      // precede the echoed peer data.
++      if (state.outgoingComplete() &&
++          state.incomingComplete() &&
++          state.echoOffset < state.incomingData.size()) {
++        const char *source = &state.incomingData[state.echoOffset];
++        size_t remaining = state.incomingData.size() - state.echoOffset;
++
++        ssize_t count = ::send(state.fd,
++                               source,
++                               remaining,
++                               MSG_DONTWAIT | MSG_NOSIGNAL);
++
++        if (count > 0) {
++          state.echoOffset += static_cast<size_t>(count);
++          madeProgress = true;
++        } else if (count < 0 &&
++                   errno != EAGAIN &&
++                   errno != EWOULDBLOCK &&
++                   errno != EINTR) {
++          JASSERT(false)
++            (state.fd) (JASSERT_ERRNO)
++            .Text("stream-refill echo send failed");
++        }
++      }
++
++      if (!state.done()) {
++        ++unfinished;
++      }
+     }
+-    ConnMsg msg;
+-    msg.poison();
+-    jalib::JSocket sock(fd);
+-    sock >> msg;
+-
+-    msg.assertValid(ConnMsg::REFILL);
+-    int size = msg.extraBytes;
+-    JTRACE("repeating buffer back to peer") (size);
+-    if (size > 0) {
+-      // echo it back...
+-      jalib::JBuffer tmp(size);
+-      sock.readAll(tmp, size);
+-      sock.writeAll(tmp, size);
++
++    if (unfinished == 0) {
++      break;
+     }
+ 
+-    // Reset the send buffer
+-    scaleSendBuffers(fd, 0.5);
++    // If no socket transferred data during this pass, wait until at least one
++    // unfinished socket becomes readable or writable, then retry all sockets.
++    if (!madeProgress) {
++      vector<struct pollfd> waitFds;
++
++      for (size_t index = 0; index < streamStates.size(); ++index) {
++        StreamRefillState &state = streamStates[index];
++        if (state.done()) {
++          continue;
++        }
++
++        struct pollfd descriptor;
++        descriptor.fd = state.fd;
++        descriptor.events = 0;
++        descriptor.revents = 0;
++
++        if (!state.incomingComplete()) {
++          descriptor.events |= POLLIN;
++        }
++
++        if (!state.outgoingComplete() ||
++            (state.incomingComplete() && !state.echoComplete())) {
++          descriptor.events |= POLLOUT;
++        }
++
++        JASSERT(descriptor.events != 0)
++          (state.fd)
++          .Text("stream-refill state has no pollable operation");
++
++        waitFds.push_back(descriptor);
++      }
++
++      JASSERT(!waitFds.empty())
++        .Text("stream-refill has unfinished work but no sockets to poll");
++
++      int pollResult;
++      do {
++        pollResult = ::poll(&waitFds[0],
++                            static_cast<nfds_t>(waitFds.size()),
++                            1000);
++      } while (pollResult < 0 && errno == EINTR);
++
++      JASSERT(pollResult >= 0)
++        (JASSERT_ERRNO)
++        .Text("poll failed during duplex stream refill");
++    }
++  }
++
++  // All stream REFILL messages and echoes have completed.  The echoed data now
++  // remains in each receive queue as the restored application data.
++  for (size_t index = 0; index < streamStates.size(); ++index) {
++    streamStates[index].outgoingData->clear();
++    scaleSendBuffers(streamStates[index].fd, 0.5);
+   }
+ 
+   // Now handle seqpacket sockets: send frames and echo back peer frames

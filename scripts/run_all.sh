@@ -71,10 +71,10 @@ case "${CHECKPOINT_CLEANUP_MODE}" in
 esac
 
 case "${EXISTING_RUN_POLICY}" in
-  replace|skip|error)
+  resume|replace|error)
     ;;
   *)
-    fail "EXISTING_RUN_POLICY must be replace, skip, or error."
+    fail "EXISTING_RUN_POLICY must be resume, replace, or error."
     ;;
 esac
 
@@ -94,7 +94,8 @@ done
 for nonnegative_setting in \
   PRE_RESTORE_FORCE_KILL_AFTER_SECONDS \
   PRE_RESTORE_FORCE_KILL_GRACE_SECONDS \
-  PRE_RESTORE_FINAL_GRACE_SECONDS; do
+  PRE_RESTORE_FINAL_GRACE_SECONDS \
+  RESTORE_RETRY_FINAL_GRACE_SECONDS; do
   is_nonnegative_number "${!nonnegative_setting}" \
     || fail "${nonnegative_setting} must be a nonnegative number; received '${!nonnegative_setting}'."
 done
@@ -110,6 +111,9 @@ fi
 
 [[ "${CR_REPETITIONS}" =~ ^[1-9][0-9]*$ ]] \
   || fail "CR_REPETITIONS must be a positive integer; received '${CR_REPETITIONS}'."
+
+[[ "${RESTORE_MAX_ATTEMPTS}" =~ ^[1-9][0-9]*$ ]] \
+  || fail "RESTORE_MAX_ATTEMPTS must be a positive integer; received '${RESTORE_MAX_ATTEMPTS}'."
 
 mkdir -p "${RESULTS_ROOT}"
 RESULTS_ROOT="$(cd -- "${RESULTS_ROOT}" && pwd)"
@@ -161,10 +165,10 @@ repetition_count = int(sys.argv[5])
 values = []
 for repetition in range(1, repetition_count + 1):
     run_dir = results_root / f"{benchmark}{npb_class}_np{np}_baseline_rep{repetition}"
-    status_file = run_dir / "run_status.txt"
+    success_marker = run_dir / "SUCCESS.marker"
     total_file = run_dir / "total_seconds.txt"
 
-    if not status_file.exists() or status_file.read_text().strip() != "SUCCESS":
+    if not success_marker.is_file():
         raise SystemExit(f"incomplete baseline run: {run_dir}")
     if not total_file.exists():
         raise SystemExit(f"missing baseline timing: {total_file}")
@@ -205,6 +209,8 @@ echo "Pre-restore cleanup:     timeout=${PRE_RESTORE_CLEANUP_TIMEOUT_SECONDS}s, 
 echo "Cleanup escalation:      TERM after ${PRE_RESTORE_FORCE_KILL_AFTER_SECONDS}s, KILL ${PRE_RESTORE_FORCE_KILL_GRACE_SECONDS}s later"
 echo "Final verified grace:    ${PRE_RESTORE_FINAL_GRACE_SECONDS}s"
 echo "Bind-failure abort:      ${RESTORE_BIND_FAILURE_ABORT_SECONDS}s persistent"
+echo "Restore attempts:        ${RESTORE_MAX_ATTEMPTS} maximum from the same checkpoint"
+echo "Retry verified grace:    ${RESTORE_RETRY_FINAL_GRACE_SECONDS}s"
 echo "DMTCP commit:           ${DMTCP_COMMIT}"
 echo "DMTCP restore backlog:  ${DMTCP_RESTORE_LISTEN_BACKLOG} (kernel somaxconn $(cat /proc/sys/net/core/somaxconn))"
 echo "MPICH:                  ${MPICH_VERSION} (${MPICH_DEVICE}, libudev ${MPICH_HWLOC_LIBUDEV})"

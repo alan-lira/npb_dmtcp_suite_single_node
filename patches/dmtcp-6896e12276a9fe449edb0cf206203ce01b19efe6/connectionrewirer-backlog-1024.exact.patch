@@ -1,0 +1,10 @@
+# DMTCP exact-substitution patch v1
+# Target: src/plugin/ipc/socket/connectionrewirer.cpp
+# Valid only for commit 6896e12276a9fe449edb0cf206203ce01b19efe6.
+# Each FROM/TO pair must occur exactly once; otherwise installation stops.
+FROM=_real_listen(ip6fd, 32)
+TO=_real_listen(ip6fd, 1024)
+FROM=_real_listen(udsfd, 32)
+TO=_real_listen(udsfd, 1024)
+FROM=_real_listen(udsseqfd, 32)
+TO=_real_listen(udsseqfd, 1024)
