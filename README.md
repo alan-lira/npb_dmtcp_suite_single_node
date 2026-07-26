@@ -14,11 +14,14 @@ The checkpoint/restart path considers the following sequence:
 2. Launch `mpirun` through `dmtcp_launch`;
 3. Request the checkpoint;
 4. Wait for all checkpoint images and the generated restart script;
-5. Kill the original DMTCP computation and let the coordinator exit;
-6. Wait for operating-system socket cleanup;
-7. Execute the generated restart script without extra coordinator arguments;
-8. Wait until every DMTCP client reports `WorkerState::RUNNING`;
-9. Wait for NPB completion and verify `Verification = SUCCESSFUL`.
+5. Capture the exact original process tree using PID and `/proc` start time;
+6. Capture the TCP, UDP, and Unix socket endpoints owned by that tree;
+7. Kill the original DMTCP computation and let the coordinator exit;
+8. Adaptively wait for the captured processes to disappear and for every captured endpoint to become reusable;
+9. Apply only a short final grace delay after the resources are verified clear;
+10. Execute the generated restart script without extra coordinator arguments;
+11. Wait until every DMTCP client reports `WorkerState::RUNNING`;
+12. Wait for NPB completion and verify `Verification = SUCCESSFUL`.
 
 The runner does not use `--ckpt-open-files` and does not reuse the original
 coordinator during restart.
@@ -33,6 +36,7 @@ scripts/
   verify_single_node_environment.sh
   run_one.sh
   run_all.sh
+  adaptive_pre_restore_cleanup.py
   summarize_results.py
   kill_dmtcp_processes.sh
   check_repository.sh
@@ -46,7 +50,7 @@ output/                         # Generated; ignored by Git
 From the repository root:
 
 ```bash
-chmod +x scripts/*.sh scripts/summarize_results.py
+chmod +x scripts/*.sh scripts/*.py
 ./scripts/check_repository.sh
 ```
 
@@ -320,8 +324,14 @@ BASELINE_REPETITIONS="3"
 CR_REPETITIONS="3"
 CHECKPOINT_PERCENTAGES_TEXT="25 50 75"
 NPB_CLASS="D"
-SOCKET_CLEANUP_SLEEP_SECONDS="10"
 DMTCP_EXPERIMENT_SIGNAL="30"
+PRE_RESTORE_CLEANUP_TIMEOUT_SECONDS="180"
+PRE_RESTORE_CLEANUP_POLL_SECONDS="0.25"
+PRE_RESTORE_FORCE_KILL_AFTER_SECONDS="10"
+PRE_RESTORE_FORCE_KILL_GRACE_SECONDS="5"
+PRE_RESTORE_FINAL_GRACE_SECONDS="2"
+PRE_RESTORE_CLEANUP_REPORT_INTERVAL_SECONDS="5"
+RESTORE_BIND_FAILURE_ABORT_SECONDS="10"
 ```
 
 `BASELINE_REPETITIONS` and `CR_REPETITIONS` are counts, not lists of
@@ -338,7 +348,9 @@ These settings mean that the suite will:
 - request checkpoints at **25%, 50%, and 75%** of the corresponding baseline
   mean;
 - execute **3 checkpoint/restart repetitions** (`rep1` through `rep3`) for each checkpoint percentage;
-- wait **10 seconds** for operating-system socket cleanup before each restore;
+- use adaptive process and socket cleanup with a complete default timeout of **180 seconds**;
+- apply a **2-second** final grace only after all captured resources are verified clear;
+- abort restore early when bind failures persist for **10 seconds**;
 - use signal **30** as the DMTCP checkpoint signal.
 
 For each benchmark and MPI-rank combination, the suite follows this order:
@@ -467,9 +479,12 @@ A checkpoint/restart execution reports each phase explicitly:
 [checkpoint] Detected 27 DMTCP clients; creating checkpoint images now.
 [checkpoint] Checkpoint recorded successfully at ...
 [checkpoint] Checkpoint storage: ... GB total | ... GB mean per rank.
-[shutdown] Killing the original DMTCP clients...
-[shutdown] Original computation and coordinator terminated.
-[cleanup] Waiting 10 seconds for operating-system socket cleanup.
+[cleanup] Capturing the exact original process tree and its TCP, UDP, and Unix socket endpoints.
+[shutdown] Requesting DMTCP client termination...
+[cleanup] Waiting adaptively for captured processes and endpoints to become safely reusable.
+[adaptive-cleanup] All captured processes have disappeared.
+[adaptive-cleanup] All captured socket endpoints are reusable.
+[cleanup] Adaptive pre-restore cleanup completed in ...
 [restore] Restoring checkpoints using script: ...
 [restore] Progress: 27/27 clients RUNNING.
 [restore] Restore complete; step took ... seconds.
@@ -477,6 +492,45 @@ A checkpoint/restart execution reports each phase explicitly:
 [run] Still running; elapsed since latest restore: ... | since initial launch: ...
 [complete] NPB verification was SUCCESSFUL.
 ```
+
+### Adaptive pre-restore cleanup
+
+Before terminating the checkpointed computation, `run_one.sh` calls
+`adaptive_pre_restore_cleanup.py capture`. The capture file records every
+process in the original application/coordinator tree as a `(PID, start time)`
+identity and records the socket inodes and endpoints referenced by those exact
+processes. A reused PID is therefore never treated as the original process.
+
+After `dmtcp_command --kill`, the cleanup helper waits for the captured
+identities to disappear. If necessary, it sends `TERM` and later `KILL` only to
+identities whose PID and start time still match the capture. Linux pidfds are
+used for escalation so a PID-reuse race cannot redirect the signal after the
+identity check. The helper never signals a process merely because that process
+owns a conflicting endpoint.
+
+For TCP and UDP endpoints, the helper waits until the captured local address and
+port can be rebound. For Unix-domain endpoints, it verifies abstract names and
+filesystem paths. A filesystem Unix socket is removed only when it is still a
+socket, is owned by the current user, and its filesystem device/inode matches
+the file captured for this run. A replaced path or an endpoint owned by an
+unrelated process causes the run to fail before the generated restart script is
+launched. Reports are written as:
+
+```text
+pre_restore_captured_state.json
+pre_restore_captured_processes.tsv
+pre_restore_captured_sockets.tsv
+pre_restore_capture.log
+pre_restore_cleanup.log
+pre_restore_cleanup_status.txt
+pre_restore_cleanup_failure.txt          # only on failure
+pre_restore_cleanup_removed_unix_sockets.txt
+```
+
+During restore, `stderr_after_restore.log` is checked continuously. Persistent
+`Address already in use` or `Bind failed` messages trigger an early failure and
+diagnostic collection after `RESTORE_BIND_FAILURE_ABORT_SECONDS`, rather than
+waiting for the complete restore timeout.
 
 ### Measurements
 
@@ -490,7 +544,8 @@ Size of checkpoints: Y1 GB total | Y2 GB mean per application rank
 Time required for the checkpoint step: X seconds
 Time required for the restore step: X seconds
 DMTCP checkpoint/restore workflow overhead: X seconds
-  Included phases: checkpoint X + post-checkpoint stabilization X + original shutdown X + socket cleanup X + restore X seconds
+  Included phases: checkpoint X + post-checkpoint stabilization X + adaptive pre-restore cleanup X + restore X seconds
+  Adaptive cleanup detail: captured-process shutdown X + endpoint verification X + final verified-clear grace X seconds
 Total DMTCP-related overhead: X seconds (... compared with baseline mean ...; complete DMTCP execution was X seconds faster/slower than the baseline)
 Residual DMTCP runtime difference: X seconds (execution outside the checkpoint/restore workflow was X seconds faster/slower than the baseline)
 ```
@@ -514,9 +569,14 @@ Definitions:
   `ckpt_*` directories;
 - **Mean per rank:** checkpoint total size divided by the number of application
   MPI ranks;
+- **Adaptive pre-restore cleanup:** the measured interval from the initial
+  post-checkpoint shutdown request through disappearance of all captured
+  PID/start-time identities, endpoint reusability verification, safe removal of
+  matching stale filesystem Unix socket files, and the final verified-clear
+  grace delay;
 - **DMTCP checkpoint/restore workflow overhead:** sum of the checkpoint step,
-  post-checkpoint stabilization, original-computation shutdown, socket-cleanup
-  delay, and restore step. The execution summary prints all five components so
+  post-checkpoint stabilization, complete adaptive pre-restore cleanup, and
+  restore step. The execution summary prints these components separately so
   this value is not confused with checkpoint time plus restore time alone;
 - **Total DMTCP-related overhead:** checkpoint/restart total duration minus the
   mean of successful matching baseline runs. A positive value means that the
@@ -537,7 +597,10 @@ Important metric files:
 total_seconds.txt
 checkpoint_seconds.txt
 post_checkpoint_stabilization_seconds.txt
+pre_restore_cleanup_seconds.txt
 original_shutdown_seconds.txt
+pre_restore_endpoint_verification_seconds.txt
+pre_restore_final_grace_seconds.txt
 socket_cleanup_sleep_seconds.txt
 dmtcp_restore_seconds.txt
 checkpoint_restore_workflow_overhead_seconds.txt
@@ -550,15 +613,21 @@ baseline_reference_seconds.txt
 execution_summary.txt
 ```
 
-The following files are retained as backward-compatible aliases for existing
-analysis scripts and result directories:
+The following files are retained as backward-compatible aliases or components
+for existing analysis scripts and result directories:
 
 ```text
+socket_cleanup_sleep_seconds.txt
 checkpoint_restore_procedure_overhead_seconds.txt
 residual_dmtcp_runtime_overhead_seconds.txt
 additional_overhead_seconds.txt
 additional_overhead_percent.txt
 ```
+
+`socket_cleanup_sleep_seconds.txt` no longer represents a blind sleep. It is
+the backward-compatible endpoint-verification plus final-grace component; when
+added to `original_shutdown_seconds.txt`, it equals
+`pre_restore_cleanup_seconds.txt`. New analysis should use the latter directly.
 
 A direct checkpoint/restart run without a matching successful baseline still
 records the DMTCP checkpoint/restore workflow overhead. The total DMTCP-related
@@ -613,8 +682,9 @@ python3 scripts/summarize_results.py \
 ```
 
 `per_run_results.csv` contains one row per successful repetition, including the
-workflow overhead, total DMTCP-related overhead, signed residual runtime
-difference, and explicit faster/slower interpretation fields.
+adaptive cleanup duration, workflow overhead, total DMTCP-related overhead,
+signed residual runtime difference, and explicit faster/slower interpretation
+fields.
 `aggregate_results.csv` groups matching repetitions and reports their means and
 sample standard deviations. A group containing only one successful repetition
 has a standard deviation of `0`.

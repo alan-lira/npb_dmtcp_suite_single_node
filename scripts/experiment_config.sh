@@ -124,9 +124,9 @@ CHECKPOINT_CLEANUP_MODE="${CHECKPOINT_CLEANUP_MODE:-delete-checkpoints}"
 #   1. Start a fresh coordinator with --exit-on-last.
 #   2. Launch the MPI application through dmtcp_launch.
 #   3. Create and validate the checkpoint images.
-#   4. Kill the original DMTCP computation.
-#   5. Allow the original coordinator to exit.
-#   6. Wait for operating-system socket cleanup.
+#   4. Capture the exact original process tree and its socket endpoints.
+#   5. Kill the original DMTCP computation and allow its coordinator to exit.
+#   6. Adaptively wait for the captured processes and endpoints to become clear.
 #   7. Execute the generated restart script without extra arguments.
 #
 # This value is intentionally fixed for the validated single-node workflow.
@@ -156,7 +156,28 @@ COORDINATOR_START_TIMEOUT_SECONDS="${COORDINATOR_START_TIMEOUT_SECONDS:-30}"
 CHECKPOINT_FILE_TIMEOUT_SECONDS="${CHECKPOINT_FILE_TIMEOUT_SECONDS:-600}"
 DMTCP_RESTORE_TIMEOUT_SECONDS="${DMTCP_RESTORE_TIMEOUT_SECONDS:-600}"
 POST_CHECKPOINT_STABILIZATION_SECONDS="${POST_CHECKPOINT_STABILIZATION_SECONDS:-2}"
-SOCKET_CLEANUP_SLEEP_SECONDS="${SOCKET_CLEANUP_SLEEP_SECONDS:-10}"
+
+# Complete adaptive cleanup timeout, including exact-process shutdown, endpoint
+# verification, removal of provably stale filesystem Unix sockets, and the
+# final verified-clear grace delay.
+PRE_RESTORE_CLEANUP_TIMEOUT_SECONDS="${PRE_RESTORE_CLEANUP_TIMEOUT_SECONDS:-180}"
+PRE_RESTORE_CLEANUP_POLL_SECONDS="${PRE_RESTORE_CLEANUP_POLL_SECONDS:-0.25}"
+
+# dmtcp_command --kill is attempted first. TERM is sent only to captured
+# PID/start-time identities that remain after this delay; KILL follows only for
+# those same surviving identities after the configured grace period.
+PRE_RESTORE_FORCE_KILL_AFTER_SECONDS="${PRE_RESTORE_FORCE_KILL_AFTER_SECONDS:-10}"
+PRE_RESTORE_FORCE_KILL_GRACE_SECONDS="${PRE_RESTORE_FORCE_KILL_GRACE_SECONDS:-5}"
+
+# Applied only after every captured TCP, UDP, and Unix endpoint has been
+# verified reusable. This replaces the previous unconditional cleanup delay.
+PRE_RESTORE_FINAL_GRACE_SECONDS="${PRE_RESTORE_FINAL_GRACE_SECONDS:-2}"
+PRE_RESTORE_CLEANUP_REPORT_INTERVAL_SECONDS="${PRE_RESTORE_CLEANUP_REPORT_INTERVAL_SECONDS:-5}"
+
+# During restore, persistent bind errors cause an early diagnostic failure
+# instead of consuming the complete DMTCP_RESTORE_TIMEOUT_SECONDS interval.
+RESTORE_BIND_FAILURE_ABORT_SECONDS="${RESTORE_BIND_FAILURE_ABORT_SECONDS:-10}"
+
 PROGRESS_INTERVAL_SECONDS="${PROGRESS_INTERVAL_SECONDS:-30}"
 RESTORE_PROGRESS_INTERVAL_SECONDS="${RESTORE_PROGRESS_INTERVAL_SECONDS:-5}"
 

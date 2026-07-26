@@ -11,6 +11,8 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=experiment_config.sh
 source "${SCRIPT_DIR}/experiment_config.sh"
 
+ADAPTIVE_CLEANUP_HELPER="${SCRIPT_DIR}/adaptive_pre_restore_cleanup.py"
+
 usage() {
   cat <<USAGE
 Usage:
@@ -47,6 +49,14 @@ is_positive_integer() {
 
 is_nonnegative_number() {
   [[ "$1" =~ ^[0-9]+([.][0-9]+)?$ ]]
+}
+
+is_positive_number() {
+  is_nonnegative_number "$1" || return 1
+  python3 - "$1" <<'PY'
+import sys
+raise SystemExit(0 if float(sys.argv[1]) > 0 else 1)
+PY
 }
 
 resolve_percentage_baseline() {
@@ -152,6 +162,32 @@ case "${EXISTING_RUN_POLICY}" in
   replace|skip|error) ;;
   *) fail "EXISTING_RUN_POLICY must be replace, skip, or error." ;;
 esac
+
+for positive_setting in \
+  PRE_RESTORE_CLEANUP_TIMEOUT_SECONDS \
+  PRE_RESTORE_CLEANUP_POLL_SECONDS \
+  PRE_RESTORE_CLEANUP_REPORT_INTERVAL_SECONDS \
+  RESTORE_BIND_FAILURE_ABORT_SECONDS; do
+  is_positive_number "${!positive_setting}" \
+    || fail "${positive_setting} must be a positive number; received '${!positive_setting}'."
+done
+
+for nonnegative_setting in \
+  PRE_RESTORE_FORCE_KILL_AFTER_SECONDS \
+  PRE_RESTORE_FORCE_KILL_GRACE_SECONDS \
+  PRE_RESTORE_FINAL_GRACE_SECONDS; do
+  is_nonnegative_number "${!nonnegative_setting}" \
+    || fail "${nonnegative_setting} must be a nonnegative number; received '${!nonnegative_setting}'."
+done
+
+[ -x "${ADAPTIVE_CLEANUP_HELPER}" ] \
+  || fail "adaptive cleanup helper is missing or not executable: ${ADAPTIVE_CLEANUP_HELPER}"
+python3 - <<'PY' \
+  || fail "Python/Linux pidfd support is required for PID-reuse-safe cleanup escalation."
+import os
+import signal
+raise SystemExit(0 if hasattr(os, "pidfd_open") and hasattr(signal, "pidfd_send_signal") else 1)
+PY
 
 if [ "${SCENARIO}" = "cr" ]; then
   case "${CHECKPOINT_MODE}" in
@@ -421,6 +457,10 @@ collect_diagnostics() {
   ps -eo pid,ppid,stat,pcpu,pmem,etime,wchan:28,cmd \
     | grep -E "dmtcp|hydra|mpiexec|mpirun|bt\.${NPB_CLASS}\.x|cg\.${NPB_CLASS}\.x" \
     | grep -v grep > "${prefix}_processes.txt" 2>&1 || true
+  if command -v ss >/dev/null 2>&1; then
+    ss -tanup > "${prefix}_inet_sockets.txt" 2>&1 || true
+    ss -xanp > "${prefix}_unix_sockets.txt" 2>&1 || true
+  fi
 
   {
     echo "Timestamp: $(date -Is)"
@@ -622,14 +662,21 @@ def read_number(name: str) -> float:
     return float(Path(name).read_text().strip())
 
 
+if Path('pre_restore_cleanup_seconds.txt').is_file():
+    pre_restore_cleanup = read_number('pre_restore_cleanup_seconds.txt')
+else:
+    # Compatibility with result directories produced before adaptive cleanup.
+    pre_restore_cleanup = (
+        read_number('original_shutdown_seconds.txt')
+        + read_number('socket_cleanup_sleep_seconds.txt')
+    )
+
 procedure_overhead = sum(
-    read_number(name)
-    for name in (
-        'checkpoint_seconds.txt',
-        'post_checkpoint_stabilization_seconds.txt',
-        'original_shutdown_seconds.txt',
-        'socket_cleanup_sleep_seconds.txt',
-        'dmtcp_restore_seconds.txt',
+    (
+        read_number('checkpoint_seconds.txt'),
+        read_number('post_checkpoint_stabilization_seconds.txt'),
+        pre_restore_cleanup,
+        read_number('dmtcp_restore_seconds.txt'),
     )
 )
 
@@ -655,7 +702,7 @@ PY
 }
 
 write_execution_summary() {
-  local total checkpoint restore stabilization shutdown socket_cleanup
+  local total checkpoint restore stabilization cleanup shutdown endpoint_verification final_grace
   local size_total size_rank baseline procedure_overhead
   local total_overhead total_overhead_pct residual_difference
 
@@ -663,8 +710,10 @@ write_execution_summary() {
   checkpoint="$(<checkpoint_seconds.txt)"
   restore="$(<dmtcp_restore_seconds.txt)"
   stabilization="$(<post_checkpoint_stabilization_seconds.txt)"
+  cleanup="$(<pre_restore_cleanup_seconds.txt)"
   shutdown="$(<original_shutdown_seconds.txt)"
-  socket_cleanup="$(<socket_cleanup_sleep_seconds.txt)"
+  endpoint_verification="$(<pre_restore_endpoint_verification_seconds.txt)"
+  final_grace="$(<pre_restore_final_grace_seconds.txt)"
   size_total="$(<checkpoint_size_gb.txt)"
   size_rank="$(<checkpoint_mean_per_rank_gb.txt)"
   baseline="$(<baseline_reference_seconds.txt)"
@@ -691,8 +740,10 @@ write_execution_summary() {
       printf 'Time required for the restore step: %.6f seconds\n' "${restore}"
       printf 'DMTCP checkpoint/restore workflow overhead: %.6f seconds\n' \
         "${procedure_overhead}"
-      printf '  Included phases: checkpoint %.6f + post-checkpoint stabilization %.6f + original shutdown %.6f + socket cleanup %.6f + restore %.6f seconds\n' \
-        "${checkpoint}" "${stabilization}" "${shutdown}" "${socket_cleanup}" "${restore}"
+      printf '  Included phases: checkpoint %.6f + post-checkpoint stabilization %.6f + adaptive pre-restore cleanup %.6f + restore %.6f seconds\n' \
+        "${checkpoint}" "${stabilization}" "${cleanup}" "${restore}"
+      printf '  Adaptive cleanup detail: captured-process shutdown %.6f + endpoint verification %.6f + final verified-clear grace %.6f seconds\n' \
+        "${shutdown}" "${endpoint_verification}" "${final_grace}"
 
       if [ "${total_overhead}" = "N/A" ]; then
         echo "Total DMTCP-related overhead: N/A (no successful baseline was available)"
@@ -782,8 +833,10 @@ write_zero_cr_metrics() {
     checkpoint_mean_per_rank_gb.txt checkpoint_mean_per_rank_gib.txt \
     checkpoint_image_count.txt dmtcp_restore_seconds.txt restore_seconds.txt \
     pre_checkpoint_runtime_seconds.txt post_checkpoint_stabilization_seconds.txt \
-    original_shutdown_seconds.txt socket_cleanup_sleep_seconds.txt \
-    post_dmtcp_restore_runtime_seconds.txt dmtcp_clients_before_checkpoint.txt \
+    pre_restore_cleanup_seconds.txt original_shutdown_seconds.txt \
+    pre_restore_endpoint_verification_seconds.txt pre_restore_final_grace_seconds.txt \
+    socket_cleanup_sleep_seconds.txt post_dmtcp_restore_runtime_seconds.txt \
+    dmtcp_clients_before_checkpoint.txt \
     dmtcp_clients_running_after_restore.txt dmtcp_restore_marker_found.txt; do
     echo "0" > "${file}"
   done
@@ -814,7 +867,13 @@ write_zero_cr_metrics() {
   echo "MPICH device: ${MPICH_DEVICE:-unknown}"
   echo "MPICH_NO_LOCAL: ${MPICH_NO_LOCAL:-}"
   echo "MPIR_CVAR_ENABLE_GPU: ${MPIR_CVAR_ENABLE_GPU:-}"
-  echo "Successful workflow: fresh coordinator, --exit-on-last, ${SOCKET_CLEANUP_SLEEP_SECONDS}-second socket cleanup, generated restart script without extra arguments"
+  echo "Successful workflow: fresh coordinator, --exit-on-last, adaptive PID/start-time and socket cleanup, generated restart script without extra arguments"
+  echo "Pre-restore cleanup timeout seconds: ${PRE_RESTORE_CLEANUP_TIMEOUT_SECONDS}"
+  echo "Pre-restore cleanup poll seconds: ${PRE_RESTORE_CLEANUP_POLL_SECONDS}"
+  echo "Pre-restore force TERM after seconds: ${PRE_RESTORE_FORCE_KILL_AFTER_SECONDS}"
+  echo "Pre-restore force KILL grace seconds: ${PRE_RESTORE_FORCE_KILL_GRACE_SECONDS}"
+  echo "Pre-restore final grace seconds: ${PRE_RESTORE_FINAL_GRACE_SECONDS}"
+  echo "Restore bind-failure abort seconds: ${RESTORE_BIND_FAILURE_ABORT_SECONDS}"
 } > run_metadata.txt
 
 printf '%s\n' "${CHECKPOINT_MODE}" > checkpoint_mode.txt
@@ -1014,12 +1073,44 @@ if ! pid_is_active "${APP_PID}"; then
   fail "original application exited unexpectedly immediately after checkpoint creation."
 fi
 
-SHUTDOWN_START_NS="$(now_ns)"
-phase shutdown "Stopping the original checkpointed computation."
-phase shutdown "Killing the original DMTCP clients on port ${PORT}; the --exit-on-last coordinator will then shut down."
-dmtcp_command --coord-port "${PORT}" --kill >/dev/null 2>&1 || true
-phase shutdown "Waiting for original mpirun and the --exit-on-last coordinator to terminate."
+CLEANUP_STATE="${RUN_DIR}/pre_restore_captured_state.json"
+phase cleanup "Capturing the exact original process tree and its TCP, UDP, and Unix socket endpoints."
+if ! python3 "${ADAPTIVE_CLEANUP_HELPER}" capture \
+  --root-pid "${APP_PID}" \
+  --root-pid "${COORD_PID}" \
+  --state "${CLEANUP_STATE}" \
+  --process-report "${RUN_DIR}/pre_restore_captured_processes.tsv" \
+  --socket-report "${RUN_DIR}/pre_restore_captured_sockets.tsv" \
+  > pre_restore_capture.log 2>&1; then
+  echo "FAILED" > run_status.txt
+  collect_diagnostics pre_restore_capture_failed
+  fail "could not capture the original process tree and socket endpoints before shutdown."
+fi
+cat pre_restore_capture.log
 
+phase shutdown "Stopping the original checkpointed computation."
+phase shutdown "Requesting DMTCP client termination on port ${PORT}; the --exit-on-last coordinator must also exit."
+dmtcp_command --coord-port "${PORT}" --kill >/dev/null 2>&1 || true
+
+phase cleanup "Waiting adaptively for captured processes and endpoints to become safely reusable."
+set +e
+python3 "${ADAPTIVE_CLEANUP_HELPER}" cleanup \
+  --state "${CLEANUP_STATE}" \
+  --metrics-dir "${RUN_DIR}" \
+  --timeout "${PRE_RESTORE_CLEANUP_TIMEOUT_SECONDS}" \
+  --poll "${PRE_RESTORE_CLEANUP_POLL_SECONDS}" \
+  --force-kill-after "${PRE_RESTORE_FORCE_KILL_AFTER_SECONDS}" \
+  --force-kill-grace "${PRE_RESTORE_FORCE_KILL_GRACE_SECONDS}" \
+  --final-grace "${PRE_RESTORE_FINAL_GRACE_SECONDS}" \
+  --report-interval "${PRE_RESTORE_CLEANUP_REPORT_INTERVAL_SECONDS}" \
+  > pre_restore_cleanup.log 2>&1
+CLEANUP_STATUS=$?
+set -e
+cat pre_restore_cleanup.log
+
+# Reap the two direct children after the helper has verified their captured
+# PID/start-time identities are no longer active. These waits cannot target a
+# reused PID because the shell waits for its own original child objects.
 set +e
 wait "${APP_PID}"
 APP_STATUS=$?
@@ -1029,16 +1120,13 @@ set -e
 APP_PID=""
 COORD_PID=""
 
-SHUTDOWN_END_NS="$(now_ns)"
-write_elapsed original_shutdown_seconds.txt "${SHUTDOWN_START_NS}" "${SHUTDOWN_END_NS}"
-phase shutdown "Original computation stopped and original coordinator terminated; shutdown phase took $(human_seconds "$(<original_shutdown_seconds.txt)")."
+if [ "${CLEANUP_STATUS}" -ne 0 ]; then
+  echo "FAILED" > run_status.txt
+  collect_diagnostics pre_restore_cleanup_failed
+  fail "adaptive pre-restore cleanup failed with status ${CLEANUP_STATUS}; restore was not launched."
+fi
 
-SOCKET_START_NS="$(now_ns)"
-phase cleanup "Waiting ${SOCKET_CLEANUP_SLEEP_SECONDS} seconds for operating-system socket cleanup before restore."
-sleep "${SOCKET_CLEANUP_SLEEP_SECONDS}"
-SOCKET_END_NS="$(now_ns)"
-write_elapsed socket_cleanup_sleep_seconds.txt "${SOCKET_START_NS}" "${SOCKET_END_NS}"
-phase cleanup "Socket-cleanup delay completed."
+phase cleanup "Adaptive pre-restore cleanup completed in $(human_seconds "$(<pre_restore_cleanup_seconds.txt)")."
 
 [ -n "${RESTART_SCRIPT}" ] && [ -f "${RESTART_SCRIPT}" ] \
   || fail "restart script disappeared before restore."
@@ -1058,6 +1146,9 @@ RESTORE_DEADLINE=$((SECONDS + DMTCP_RESTORE_TIMEOUT_SECONDS))
 LAST_RESTORE_REPORT=$((SECONDS - RESTORE_PROGRESS_INTERVAL_SECONDS))
 RESTORE_FOUND=0
 RUNNING_AFTER_RESTORE=0
+BIND_FAILURE_FIRST_SEEN_SECONDS=""
+BIND_FAILURE_LAST_COUNT=0
+BIND_FAILURE_PATTERN='Address already in use|Bind failed'
 
 while pid_is_active "${RESTORED_PID}"; do
   AFTER_LIST="$(dmtcp_list)"
@@ -1083,6 +1174,36 @@ while pid_is_active "${RESTORED_PID}"; do
       RESTORE_FOUND=1
       RUNNING_AFTER_RESTORE="${RUNNING_CONFIRM}"
       break
+    fi
+  fi
+
+  BIND_FAILURE_COUNT="$(grep -Eic "${BIND_FAILURE_PATTERN}" stderr_after_restore.log 2>/dev/null || true)"
+  if [ "${BIND_FAILURE_COUNT}" -gt 0 ]; then
+    if [ -z "${BIND_FAILURE_FIRST_SEEN_SECONDS}" ]; then
+      BIND_FAILURE_FIRST_SEEN_SECONDS="${SECONDS}"
+      phase restore "Detected bind-related errors in stderr_after_restore.log; allowing ${RESTORE_BIND_FAILURE_ABORT_SECONDS}s for transient recovery."
+    fi
+    if [ "${BIND_FAILURE_COUNT}" -ne "${BIND_FAILURE_LAST_COUNT}" ]; then
+      printf '%s\n' "${BIND_FAILURE_COUNT}" > restore_bind_failure_count.txt
+      BIND_FAILURE_LAST_COUNT="${BIND_FAILURE_COUNT}"
+    fi
+    if python3 - "${SECONDS}" "${BIND_FAILURE_FIRST_SEEN_SECONDS}" "${RESTORE_BIND_FAILURE_ABORT_SECONDS}" <<'PY'
+import sys
+now, first, threshold = map(float, sys.argv[1:])
+raise SystemExit(0 if now - first >= threshold else 1)
+PY
+    then
+      {
+        echo "First detected at shell elapsed second: ${BIND_FAILURE_FIRST_SEEN_SECONDS}"
+        echo "Aborted at shell elapsed second: ${SECONDS}"
+        echo "Configured persistence threshold: ${RESTORE_BIND_FAILURE_ABORT_SECONDS}"
+        echo "Matching stderr lines: ${BIND_FAILURE_COUNT}"
+        grep -Ein "${BIND_FAILURE_PATTERN}" stderr_after_restore.log 2>/dev/null || true
+      } > restore_bind_failure_detected.txt
+      echo "0" > dmtcp_restore_marker_found.txt
+      echo "FAILED" > run_status.txt
+      collect_diagnostics restore_persistent_bind_failure
+      fail "persistent bind/address-in-use errors were detected during restore; aborted before the full restore timeout."
     fi
   fi
 

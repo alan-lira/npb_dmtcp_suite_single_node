@@ -43,7 +43,10 @@ PER_RUN_FIELDS = [
     "total_seconds",
     "checkpoint_seconds",
     "post_checkpoint_stabilization_seconds",
+    "pre_restore_cleanup_seconds",
     "original_shutdown_seconds",
+    "pre_restore_endpoint_verification_seconds",
+    "pre_restore_final_grace_seconds",
     "socket_cleanup_seconds",
     "restore_seconds",
     "checkpoint_restore_workflow_overhead_seconds",
@@ -74,6 +77,7 @@ AGGREGATE_ID_FIELDS = [
 AGGREGATE_METRICS = [
     "total_seconds",
     "checkpoint_seconds",
+    "pre_restore_cleanup_seconds",
     "restore_seconds",
     "checkpoint_restore_workflow_overhead_seconds",
     "baseline_reference_seconds",
@@ -230,9 +234,22 @@ def parse_run_directory(run_dir: Path) -> Optional[Dict[str, object]]:
         run_dir, ("post_checkpoint_stabilization_seconds.txt",)
     )
     shutdown_seconds = read_number(run_dir, ("original_shutdown_seconds.txt",))
+    endpoint_verification_seconds = read_number(
+        run_dir, ("pre_restore_endpoint_verification_seconds.txt",)
+    )
+    final_grace_seconds = read_number(
+        run_dir, ("pre_restore_final_grace_seconds.txt",)
+    )
     socket_cleanup_seconds = read_number(
         run_dir, ("socket_cleanup_sleep_seconds.txt",)
     )
+    pre_restore_cleanup_seconds = read_number(
+        run_dir, ("pre_restore_cleanup_seconds.txt",)
+    )
+    if pre_restore_cleanup_seconds is None:
+        pre_restore_cleanup_seconds = sum_available(
+            (shutdown_seconds, socket_cleanup_seconds)
+        )
     restore_seconds = read_number(
         run_dir, ("dmtcp_restore_seconds.txt", "restore_seconds.txt")
     )
@@ -249,8 +266,7 @@ def parse_run_directory(run_dir: Path) -> Optional[Dict[str, object]]:
             (
                 checkpoint_seconds,
                 stabilization_seconds,
-                shutdown_seconds,
-                socket_cleanup_seconds,
+                pre_restore_cleanup_seconds,
                 restore_seconds,
             )
         )
@@ -306,7 +322,10 @@ def parse_run_directory(run_dir: Path) -> Optional[Dict[str, object]]:
     if scenario == "baseline":
         checkpoint_seconds = None
         stabilization_seconds = None
+        pre_restore_cleanup_seconds = None
         shutdown_seconds = None
+        endpoint_verification_seconds = None
+        final_grace_seconds = None
         socket_cleanup_seconds = None
         restore_seconds = None
         workflow_overhead = None
@@ -332,7 +351,10 @@ def parse_run_directory(run_dir: Path) -> Optional[Dict[str, object]]:
         "total_seconds": total_seconds,
         "checkpoint_seconds": checkpoint_seconds,
         "post_checkpoint_stabilization_seconds": stabilization_seconds,
+        "pre_restore_cleanup_seconds": pre_restore_cleanup_seconds,
         "original_shutdown_seconds": shutdown_seconds,
+        "pre_restore_endpoint_verification_seconds": endpoint_verification_seconds,
+        "pre_restore_final_grace_seconds": final_grace_seconds,
         "socket_cleanup_seconds": socket_cleanup_seconds,
         "restore_seconds": restore_seconds,
         "checkpoint_restore_workflow_overhead_seconds": workflow_overhead,
@@ -479,8 +501,8 @@ def print_console_summary(
 
         print()
         print(
-            "Target | Reps | Total (s) | Checkpoint (s) | Restore (s) | "
-            "Workflow (s) | Total DMTCP | Residual difference | Size (GB)"
+            "Target | Reps | Total (s) | Checkpoint (s) | Cleanup (s) | "
+            "Restore (s) | Workflow (s) | Total DMTCP | Residual difference | Size (GB)"
         )
         print("-" * 160)
         for row in cr_rows:
@@ -503,6 +525,7 @@ def print_console_summary(
                 f"{int(row['successful_repetitions']):4d} | "
                 f"{format_value(row['total_seconds_mean']):>9} | "
                 f"{format_value(row['checkpoint_seconds_mean']):>14} | "
+                f"{format_value(row['pre_restore_cleanup_seconds_mean']):>11} | "
                 f"{format_value(row['restore_seconds_mean']):>11} | "
                 f"{format_value(row['checkpoint_restore_workflow_overhead_seconds_mean']):>12} | "
                 f"{total_summary:>19} | "
