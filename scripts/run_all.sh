@@ -203,6 +203,7 @@ echo "Cleanup escalation:      TERM after ${PRE_RESTORE_FORCE_KILL_AFTER_SECONDS
 echo "Final verified grace:    ${PRE_RESTORE_FINAL_GRACE_SECONDS}s"
 echo "Bind-failure abort:      ${RESTORE_BIND_FAILURE_ABORT_SECONDS}s persistent"
 echo "DMTCP commit:           ${DMTCP_COMMIT}"
+echo "DMTCP restore backlog:  ${DMTCP_RESTORE_LISTEN_BACKLOG} (kernel somaxconn $(cat /proc/sys/net/core/somaxconn))"
 echo "MPICH:                  ${MPICH_VERSION} (${MPICH_DEVICE}, libudev ${MPICH_HWLOC_LIBUDEV})"
 echo "DMTCP signal:           ${DMTCP_EXPERIMENT_SIGNAL}"
 echo "Output root:            ${OUTPUT_ROOT}"

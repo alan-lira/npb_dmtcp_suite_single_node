@@ -57,6 +57,7 @@ NPB_CLASS="${NPB_CLASS:-D}"
 
 # Exact single-node stack preserved from the previously working package.
 WORKING_DMTCP_COMMIT="${WORKING_DMTCP_COMMIT:-6896e12276a9fe449edb0cf206203ce01b19efe6}"
+WORKING_DMTCP_RESTORE_LISTEN_BACKLOG="${WORKING_DMTCP_RESTORE_LISTEN_BACKLOG:-1024}"
 WORKING_MPICH_VERSION="${WORKING_MPICH_VERSION:-5.0.0}"
 WORKING_MPICH_DEVICE="${WORKING_MPICH_DEVICE:-ch3:nemesis}"
 
@@ -189,6 +190,7 @@ verify_single_node_stack() {
   local command_name
   local executable
   local expected_root
+  local kernel_somaxconn
   local required_variable
 
   case "${REQUIRE_WORKING_STACK}" in
@@ -220,6 +222,34 @@ verify_single_node_stack() {
     echo "ERROR: Unexpected DMTCP commit." >&2
     echo "  Required: ${WORKING_DMTCP_COMMIT}" >&2
     echo "  Active:   ${DMTCP_COMMIT:-unset}" >&2
+    return 1
+  fi
+
+  if [ "${DMTCP_RESTORE_BACKLOG_PATCH:-}" != "1" ] || \
+     [ "${DMTCP_RESTORE_LISTEN_BACKLOG:-}" != "${WORKING_DMTCP_RESTORE_LISTEN_BACKLOG}" ]; then
+    echo "ERROR: The active DMTCP installation does not contain the" >&2
+    echo "required restore-listener backlog patch." >&2
+    echo "  Required backlog: ${WORKING_DMTCP_RESTORE_LISTEN_BACKLOG}" >&2
+    echo "  Active backlog:   ${DMTCP_RESTORE_LISTEN_BACKLOG:-unset}" >&2
+    echo "Rebuild DMTCP with install_dmtcp_mpich_env.sh." >&2
+    return 1
+  fi
+
+  if ! grep -Fxq \
+      "dmtcp_restore_listen_backlog=${WORKING_DMTCP_RESTORE_LISTEN_BACKLOG}" \
+      "${DMTCP_MPICH_MANIFEST:-/nonexistent}" 2>/dev/null; then
+    echo "ERROR: The build manifest does not verify the required" >&2
+    echo "DMTCP restore-listener backlog patch." >&2
+    return 1
+  fi
+
+  kernel_somaxconn="$(cat /proc/sys/net/core/somaxconn 2>/dev/null || true)"
+  if ! [[ "${kernel_somaxconn}" =~ ^[0-9]+$ ]] || \
+     [ "${kernel_somaxconn}" -lt "${WORKING_DMTCP_RESTORE_LISTEN_BACKLOG}" ]; then
+    echo "ERROR: net.core.somaxconn is smaller than the DMTCP" >&2
+    echo "restore-listener backlog." >&2
+    echo "  Required minimum: ${WORKING_DMTCP_RESTORE_LISTEN_BACKLOG}" >&2
+    echo "  Active value:     ${kernel_somaxconn:-unreadable}" >&2
     return 1
   fi
 

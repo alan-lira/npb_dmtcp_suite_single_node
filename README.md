@@ -50,7 +50,7 @@ output/                         # Generated; ignored by Git
 From the repository root:
 
 ```bash
-chmod +x scripts/*.sh scripts/*.py
+chmod +x scripts/*.sh scripts/*.py tests/*.py
 ./scripts/check_repository.sh
 ```
 

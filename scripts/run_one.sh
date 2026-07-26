@@ -862,6 +862,8 @@ write_zero_cr_metrics() {
   echo "Binary root: ${BINARY_ROOT}"
   echo "Binary: ${NPB_BIN}"
   echo "DMTCP commit: ${DMTCP_COMMIT:-unknown}"
+  echo "DMTCP restore listener backlog: ${DMTCP_RESTORE_LISTEN_BACKLOG:-unknown}"
+  echo "Kernel net.core.somaxconn: $(cat /proc/sys/net/core/somaxconn)"
   echo "DMTCP signal: ${DMTCP_SIGCKPT}"
   echo "MPICH version: ${MPICH_VERSION:-unknown}"
   echo "MPICH device: ${MPICH_DEVICE:-unknown}"
@@ -883,6 +885,8 @@ printf '%s\n' "${CHECKPOINT_DELAY_SECONDS}" > checkpoint_target_seconds.txt
 printf '%s\n' "${DMTCP_SIGCKPT}" > dmtcp_signal.txt
 printf '%s\n' "fresh" > coordinator_lifecycle.txt
 printf '%s\n' "${DMTCP_COMMIT:-unknown}" > dmtcp_commit.txt
+printf '%s\n' "${DMTCP_RESTORE_LISTEN_BACKLOG:-unknown}" > dmtcp_restore_listen_backlog.txt
+cat /proc/sys/net/core/somaxconn > kernel_net_core_somaxconn.txt
 printf '%s\n' "${MPICH_VERSION:-unknown}" > mpich_version.txt
 printf '%s\n' "${MPICH_DEVICE:-unknown}" > mpich_device.txt
 

@@ -35,7 +35,8 @@ if (
     "${PRE_RESTORE_FORCE_KILL_GRACE_SECONDS}" \
     "${PRE_RESTORE_FINAL_GRACE_SECONDS}" \
     "${PRE_RESTORE_CLEANUP_REPORT_INTERVAL_SECONDS}" \
-    "${RESTORE_BIND_FAILURE_ABORT_SECONDS}"
+    "${RESTORE_BIND_FAILURE_ABORT_SECONDS}" \
+    "${WORKING_DMTCP_RESTORE_LISTEN_BACKLOG}"
 ); then
   printf '[OK] runtime load: scripts/experiment_config.sh\n'
 else
@@ -97,6 +98,24 @@ for setting in "${required_settings[@]}"; do
     printf '[OK] adaptive setting documented and used: %s\n' "${setting}"
   else
     printf '[ERROR] adaptive setting missing from config, runner, or README: %s\n' "${setting}" >&2
+    failed=1
+  fi
+done
+
+for backlog_file in \
+  "${SCRIPT_DIR}/install_dmtcp_mpich_env.sh" \
+  "${SCRIPT_DIR}/experiment_config.sh" \
+  "${SCRIPT_DIR}/verify_single_node_environment.sh" \
+  "${SCRIPT_DIR}/run_all.sh" \
+  "${SCRIPT_DIR}/run_one.sh" \
+  "${REPO_ROOT}/README.md"; do
+  if grep -q 'DMTCP_RESTORE_LISTEN_BACKLOG\|restore-listener backlog\|restore listener backlog' \
+      "${backlog_file}"; then
+    printf '[OK] DMTCP restore-backlog fix integrated: %s\n' \
+      "${backlog_file#${REPO_ROOT}/}"
+  else
+    printf '[ERROR] DMTCP restore-backlog integration missing: %s\n' \
+      "${backlog_file#${REPO_ROOT}/}" >&2
     failed=1
   fi
 done
