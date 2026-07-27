@@ -28,6 +28,7 @@ def main() -> int:
     run_one = (SCRIPTS / "run_one.sh").read_text()
     summarizer = (SCRIPTS / "summarize_results.py").read_text()
     cleanup = (SCRIPTS / "adaptive_pre_restore_cleanup.py").read_text()
+    reservation = (SCRIPTS / "restore_port_reservation.py").read_text()
     readme = (REPO_ROOT / "README.md").read_text()
     patch_dir = (
         REPO_ROOT
@@ -47,7 +48,7 @@ def main() -> int:
     backlog_patch_sha256 = hashlib.sha256(backlog_patch_path.read_bytes()).hexdigest()
     duplex_patch_sha256 = hashlib.sha256(duplex_patch_path.read_bytes()).hexdigest()
     require(
-        backlog_patch_sha256 == "5238eb9c961f03201de5de19e7c59cf1f3abd270c97588e2d3dca911ea65b7ad",
+        backlog_patch_sha256 == "72bc6bc3d338a78c9e1ebe89692f12c544e92ad2862be58b8aca942702a981a1",
         f"unexpected restore-backlog patch checksum: {backlog_patch_sha256}",
     )
     require(
@@ -59,6 +60,14 @@ def main() -> int:
     require('make -j"${BUILD_JOBS}"' in installer, "installer does not use BUILD_JOBS")
     require('make -j"$(nproc)"' not in installer, "unbounded nproc build remains")
 
+    require(
+        "FROM=jalib::JServerSocket restoreSocket(sockAddr, 0);" in backlog_patch,
+        "backlog patch FROM directive missing for the primary IPv4 listener",
+    )
+    require(
+        "TO=jalib::JServerSocket restoreSocket(sockAddr, 0, 1024);" in backlog_patch,
+        "backlog patch TO directive missing for the primary IPv4 listener",
+    )
     for fd_name in ("ip6fd", "udsfd", "udsseqfd"):
         require(
             f"FROM=_real_listen({fd_name}, 32)" in backlog_patch,
@@ -78,6 +87,10 @@ def main() -> int:
         "configuration backlog default is missing",
     )
     require("DMTCP restore-listener backlog" in readme, "README backlog documentation missing")
+    require(
+        'DMTCP_RESTORE_LISTENER_PATHS="4"' in installer,
+        "environment helper does not report four patched listener paths",
+    )
 
     require(
         'WORKING_DMTCP_BACKLOG_PATCH_SHA256=' in installer,
@@ -136,6 +149,23 @@ def main() -> int:
     require("restore_attempt_count" in summarizer, "summarizer does not expose restore-attempt counts")
     require("restore_retry_count" in summarizer, "summarizer does not expose restore-retry counts")
     require("Automatic restore retries" in readme, "README restore-retry documentation missing")
+    require(
+        'RESTORE_RESERVE_ORIGINAL_TCP_PORTS="${RESTORE_RESERVE_ORIGINAL_TCP_PORTS:-true}"'
+        in config,
+        "restore-port reservation default is missing",
+    )
+    require("reserve_restore_ports" in run_one, "restore-port reservation setup is missing")
+    require("release_restore_ports" in run_one, "restore-port reservation release is missing")
+    require("flock -w" in run_one, "restore-port reservation is not serialized")
+    require("ip_local_reserved_ports" in reservation, "reservation helper targets no sysctl")
+    require(
+        "captured_ipv4_tcp_listener_ports" in reservation,
+        "reservation helper does not extract captured listeners",
+    )
+    require(
+        "Restore-port collision protection" in readme,
+        "README restore-port protection documentation missing",
+    )
 
     final_wait = run_one.index('wait "${RESTORED_PID}"', run_one.index("monitor_background_process"))
     final_refresh = run_one.index(
@@ -169,7 +199,7 @@ def main() -> int:
         "socket_cleanup_sleep_seconds.txt",
         "total_wall_seconds.txt",
     )
-    production_text = "\n".join((run_one, summarizer, cleanup, readme))
+    production_text = "\n".join((run_one, summarizer, cleanup, reservation, readme))
     for artifact in forbidden_artifacts:
         require(artifact not in production_text, f"obsolete artifact remains: {artifact}")
 

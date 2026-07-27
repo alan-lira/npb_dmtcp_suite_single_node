@@ -38,7 +38,7 @@ DMTCP_REF="${DMTCP_REF:-6896e12276a9fe449edb0cf206203ce01b19efe6}"
 
 WORKING_DMTCP_COMMIT="6896e12276a9fe449edb0cf206203ce01b19efe6"
 WORKING_DMTCP_RESTORE_LISTEN_BACKLOG="1024"
-WORKING_DMTCP_BACKLOG_PATCH_SHA256="5238eb9c961f03201de5de19e7c59cf1f3abd270c97588e2d3dca911ea65b7ad"
+WORKING_DMTCP_BACKLOG_PATCH_SHA256="72bc6bc3d338a78c9e1ebe89692f12c544e92ad2862be58b8aca942702a981a1"
 WORKING_DMTCP_DUPLEX_PATCH_SHA256="f2c7baf517f7f7076a12e5703e36ab089b918b6aff72b544ddf1a59c46db897d"
 WORKING_DMTCP_KERNELBUFFERDRAINER_ORIGINAL_SHA256="1913813176868a6226245963b90b5976c802bc70dc3a924d2405c2375b5bf94d"
 WORKING_DMTCP_KERNELBUFFERDRAINER_PATCHED_SHA256="c5d7b960220762b6a291f5a1aef5989786ed47c00318dcc78a8fb2b6db9cf04c"
@@ -290,9 +290,9 @@ for line_number, raw_line in enumerate(patch_path.read_text().splitlines(), 1):
         )
     entries.append((kind, value))
 
-if len(entries) != 6:
+if len(entries) != 8:
     raise SystemExit(
-        f"ERROR: expected three FROM/TO pairs; found {len(entries)} directives."
+        f"ERROR: expected four FROM/TO pairs; found {len(entries)} directives."
     )
 
 pairs = []
@@ -332,16 +332,23 @@ source_path.write_text(text)
 PY
 
   RESTORE_LISTEN_CALL_COUNT="$(
-    grep -Ec "_real_listen\\((ip6fd|udsfd|udsseqfd), ${WORKING_DMTCP_RESTORE_LISTEN_BACKLOG}\\)" \
+    grep -Ec "_real_listen\((ip6fd|udsfd|udsseqfd), ${WORKING_DMTCP_RESTORE_LISTEN_BACKLOG}\)" \
       "${DMTCP_CONNECTION_REWIRER_SOURCE}"
   )"
-  if [ "${RESTORE_LISTEN_CALL_COUNT}" -ne 3 ]; then
+  RESTORE_IPV4_LISTENER_COUNT="$(
+    grep -Fc "jalib::JServerSocket restoreSocket(sockAddr, 0, ${WORKING_DMTCP_RESTORE_LISTEN_BACKLOG});" \
+      "${DMTCP_CONNECTION_REWIRER_SOURCE}"
+  )"
+  if [ "${RESTORE_LISTEN_CALL_COUNT}" -ne 3 ] || \
+     [ "${RESTORE_IPV4_LISTENER_COUNT}" -ne 1 ]; then
     echo "ERROR: DMTCP restore-listener backlog patch verification failed." >&2
-    grep -nE '_real_listen\((ip6fd|udsfd|udsseqfd),' \
+    grep -nE 'JServerSocket restoreSocket|_real_listen\((ip6fd|udsfd|udsseqfd),' \
       "${DMTCP_CONNECTION_REWIRER_SOURCE}" >&2 || true
     exit 1
   fi
-  if grep -Eq '_real_listen\((ip6fd|udsfd|udsseqfd), 32\)' \
+  if grep -Fq 'jalib::JServerSocket restoreSocket(sockAddr, 0);' \
+      "${DMTCP_CONNECTION_REWIRER_SOURCE}" || \
+     grep -Eq '_real_listen\((ip6fd|udsfd|udsseqfd), 32\)' \
       "${DMTCP_CONNECTION_REWIRER_SOURCE}"; then
     echo "ERROR: At least one DMTCP restore listener still uses backlog 32." >&2
     exit 1
@@ -350,7 +357,7 @@ PY
   DMTCP_CONNECTION_REWIRER_SHA256="$(
     sha256sum "${DMTCP_CONNECTION_REWIRER_SOURCE}" | awk '{print $1}'
   )"
-  grep -nE '_real_listen\((ip6fd|udsfd|udsseqfd),' \
+  grep -nE 'JServerSocket restoreSocket|_real_listen\((ip6fd|udsfd|udsseqfd),' \
     "${DMTCP_CONNECTION_REWIRER_SOURCE}"
 
   echo "Applying nonblocking duplex stream-refill patch asset:"
@@ -626,7 +633,7 @@ DMTCP_MPICH_MANIFEST="${ROOT_PREFIX}/dmtcp_mpich_single_node_manifest.txt"
 
 {
   echo "profile=DMTCP_MPICH_SINGLE_NODE"
-  echo "profile_version=5"
+  echo "profile_version=6"
   echo "build_timestamp=$(date -Is)"
   echo "kernel=$(uname -srvo)"
   echo "gcc=$(gcc --version | head -n 1)"
@@ -638,6 +645,7 @@ DMTCP_MPICH_MANIFEST="${ROOT_PREFIX}/dmtcp_mpich_single_node_manifest.txt"
   echo "dmtcp_home=${DMTCP_PREFIX}"
   echo "dmtcp_versioned_home=${DMTCP_PREFIX_VERSIONED}"
   echo "dmtcp_restore_listen_backlog=${WORKING_DMTCP_RESTORE_LISTEN_BACKLOG}"
+  echo "dmtcp_restore_listener_paths=4"
   echo "dmtcp_restore_backlog_patch=${DMTCP_RESTORE_BACKLOG_PATCH}"
   echo "dmtcp_backlog_patch_file_sha256=${DMTCP_BACKLOG_PATCH_FILE_SHA256}"
   echo "dmtcp_connectionrewirer_sha256=${DMTCP_CONNECTION_REWIRER_SHA256}"
@@ -685,6 +693,7 @@ export DMTCP_REF="${DMTCP_REF}"
 export DMTCP_COMMIT="${DMTCP_FULL_COMMIT}"
 export DMTCP_SINGLE_NODE_PROFILE="${DMTCP_SINGLE_NODE_PROFILE}"
 export DMTCP_RESTORE_LISTEN_BACKLOG="${WORKING_DMTCP_RESTORE_LISTEN_BACKLOG}"
+export DMTCP_RESTORE_LISTENER_PATHS="4"
 export DMTCP_RESTORE_BACKLOG_PATCH="${DMTCP_RESTORE_BACKLOG_PATCH}"
 export DMTCP_DUPLEX_REFILL_PATCH="${DMTCP_DUPLEX_REFILL_PATCH}"
 export DMTCP_KERNELBUFFERDRAINER_SHA256="${DMTCP_KERNELBUFFERDRAINER_SHA256}"

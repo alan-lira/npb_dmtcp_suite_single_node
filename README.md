@@ -6,8 +6,8 @@ with NAS Parallel Benchmarks (NPB-MPI), MPICH, and DMTCP.
 The validated software profile is:
 
 - DMTCP commit `6896e12276a9fe449edb0cf206203ce01b19efe6`;
-- DMTCP restore-listener backlog patched from `32` to `1024` for IPv6,
-  Unix-stream, and Unix-seqpacket restore sockets;
+- DMTCP restore-listener backlog patched from `32` to `1024` for the primary
+  IPv4 `JServerSocket`, IPv6, Unix-stream, and Unix-seqpacket restore sockets;
 - DMTCP stream-buffer refill replaced with a nonblocking duplex state machine
   to prevent symmetric refill deadlocks when both MPI peers restore large
   buffered payloads;
@@ -44,15 +44,20 @@ Checkpoint/restart experiments then use this sequence:
    to become reusable.
 9. Apply the configured final grace interval only after all endpoints are
    verified clear.
-10. Execute the generated DMTCP restart script without extra coordinator
+10. Under a suite-wide lock, add the captured original IPv4 TCP listener ports
+    to `net.ipv4.ip_local_reserved_ports` so DMTCP's temporary
+    `bind(port=0)` restore listener cannot consume one of them.
+11. Execute the generated DMTCP restart script without extra coordinator
     arguments.
-11. Wait until every expected DMTCP client reports `WorkerState::RUNNING`.
-12. If the restore stalls, reports persistent bind errors, or exits before all
+12. Wait until every expected DMTCP client reports `WorkerState::RUNNING`.
+13. If the restore stalls, reports persistent bind errors, or exits before all
     clients are running, preserve per-attempt diagnostics, clean the failed
-    restored process tree and endpoints, and retry the same checkpoint.
-13. Continue from the first successful restore attempt.
-14. Wait for NPB completion and require `Verification = SUCCESSFUL`.
-15. Create `SUCCESS.marker` atomically.
+    restored process tree and endpoints, and retry the same checkpoint while
+    keeping the captured ports reserved.
+14. After a successful socket restart, restore the previous reserved-port
+    setting and release the lock.
+15. Continue the restored application, require `Verification = SUCCESSFUL`,
+    and create `SUCCESS.marker` atomically.
 
 The runner does not use `--ckpt-open-files` and does not reuse the original
 coordinator during restart.
@@ -67,6 +72,7 @@ patches/
     kernelbufferdrainer-duplex-refill.patch
 scripts/
   adaptive_pre_restore_cleanup.py
+  restore_port_reservation.py
   build_npb_bt_cg_d.sh
   check_repository.sh
   experiment_config.sh
@@ -81,6 +87,7 @@ scripts/
 tests/
   test_adaptive_pre_restore_cleanup.py
   test_repository_contract.py
+  test_restore_port_reservation.py
   test_restore_retry.py
   test_run_resume.py
   test_summarize_results.py
@@ -116,10 +123,11 @@ The installer:
 2. builds local Autoconf `2.72`;
 3. checks out the exact DMTCP commit;
 4. verifies the checksums of both files in the commit-specific patch bundle;
-5. applies `connectionrewirer-backlog-1024.exact.patch`, changing exactly these
-   three restore listeners from backlog `32` to `1024`:
+5. applies `connectionrewirer-backlog-1024.exact.patch`, changing exactly
+   four restore-listener paths from backlog `32` to `1024`:
 
    ```cpp
+   jalib::JServerSocket restoreSocket(sockAddr, 0, 1024);
    _real_listen(ip6fd, 1024)
    _real_listen(udsfd, 1024)
    _real_listen(udsseqfd, 1024)
@@ -146,8 +154,8 @@ patches/dmtcp-6896e12276a9fe449edb0cf206203ce01b19efe6/
 ```
 
 `connectionrewirer-backlog-1024.exact.patch` is a deliberately small exact
-substitution patch. Its three `FROM` values must each occur exactly once and
-its three `TO` values must not already exist; otherwise installation stops
+substitution patch. Its four `FROM` values must each occur exactly once and
+its four `TO` values must not already exist; otherwise installation stops
 without modifying the source. This avoids silently applying the backlog change
 to an unexpected DMTCP source layout.
 
@@ -350,6 +358,34 @@ baseline repetitions are skipped, while missing or incomplete baseline
 repetitions are executed. Use `RUN_BASELINE=false` only when every requested
 baseline marker and timing file already exist.
 
+## Restore-port collision protection
+
+The original failure included a case where DMTCP's temporary protected IPv4
+restore listener (`fd=823`) selected an original application listener port via
+`bind(port=0)`. The restored application later tried to recreate that same
+port and received `EADDRINUSE`.
+
+For checkpoint/restart runs, `run_one.sh` now extracts the captured original
+IPv4 TCP `LISTEN` ports and temporarily merges them into:
+
+```text
+/proc/sys/net/ipv4/ip_local_reserved_ports
+```
+
+The runner holds `RESTORE_PORT_RESERVATION_LOCK_FILE` for the complete restore
+attempt sequence, including retry cleanup. Explicit application binds can
+still recreate their requested ports, while automatic ephemeral allocation
+avoids the reserved set. Once every expected DMTCP client reaches `RUNNING`,
+the runner restores the exact previous value. The EXIT/INT/TERM cleanup path
+also performs restoration. If another administrator changes the sysctl during
+the transaction, the helper removes only this run's additions and preserves
+the unrelated change.
+
+This protection is enabled by default and requires permission to write the
+sysctl (the experiments are normally run as `root`). Disabling it with
+`RESTORE_RESERVE_ORIGINAL_TCP_PORTS=false` is intended only for controlled
+comparison tests.
+
 ## Automatic restore retries
 
 The patched DMTCP IPC plugin removes the deterministic symmetric stream-buffer
@@ -438,8 +474,10 @@ The cleanup sends `TERM`, waits, sends `KILL` to remaining matching processes,
 and fails the new experiment if any matching DMTCP/MPI/NPB process still
 remains.
 
-The cleanup applies to matching processes owned by the current user. This
-suite is intended for one experiment at a time on a single node.
+The cleanup applies to matching processes owned by the current user, while
+excluding the cleanup script and its caller ancestry. This prevents a shell or
+test harness that merely mentions a matched executable name from being killed.
+The suite is intended for one experiment at a time on a single node.
 
 ## Main configuration variables
 
@@ -456,6 +494,10 @@ suite is intended for one experiment at a time on a single node.
 | `DMTCP_RESTORE_TIMEOUT_SECONDS` | `600` | Timeout applied independently to each restore attempt |
 | `RESTORE_MAX_ATTEMPTS` | `3` | Maximum attempts from the same checkpoint |
 | `RESTORE_RETRY_FINAL_GRACE_SECONDS` | `10` | Verified-clear grace before a retry |
+| `RESTORE_RESERVE_ORIGINAL_TCP_PORTS` | `true` | Reserve captured IPv4 TCP listeners during restore |
+| `RESTORE_PORT_RESERVATION_LOCK_FILE` | `/run/lock/npb_dmtcp_restore_ports.lock` | Serialize temporary reserved-port changes |
+| `RESTORE_PORT_RESERVATION_LOCK_TIMEOUT_SECONDS` | `30` | Maximum lock-acquisition wait |
+| `RESTORE_IP_LOCAL_RESERVED_PORTS_PATH` | `/proc/sys/net/ipv4/ip_local_reserved_ports` | Reserved-port sysctl path |
 | `CHECKPOINT_FILE_TIMEOUT_SECONDS` | `600` | Checkpoint-image timeout |
 | `DMTCP_EXPERIMENT_SIGNAL` | `30` | DMTCP checkpoint signal |
 | `DMTCP_PORT_MIN` | `20000` | Random coordinator-port lower bound |
@@ -505,6 +547,11 @@ pre_restore_cleanup_seconds.txt
 original_shutdown_seconds.txt
 pre_restore_endpoint_verification_seconds.txt
 pre_restore_final_grace_seconds.txt
+restore_reserved_tcp_listener_ports.txt
+restore_port_reservation_state.json
+restore_port_reservation_prepare.log
+restore_port_reservation_release.log
+restore_port_reservation_status.txt
 dmtcp_restore_seconds.txt
 successful_restore_attempt_seconds.txt
 restore_attempt_count.txt
@@ -536,10 +583,11 @@ checkpoint images and the generated restart script.
 including captured-process shutdown, endpoint verification, and the final
 verified-clear grace interval.
 
-`dmtcp_restore_seconds.txt` measures the complete restore phase from the first
-restart-script launch until one attempt reaches all expected DMTCP clients in
-`WorkerState::RUNNING`. It includes failed-attempt duration, retry cleanup, and
-the configured verified-clear retry grace.
+`dmtcp_restore_seconds.txt` measures the complete restore phase from
+preparing the captured-port reservation until the previous reserved-port value
+is restored after one attempt reaches all expected DMTCP clients in
+`WorkerState::RUNNING`. It includes reservation setup/release, failed-attempt
+duration, retry cleanup, and the configured verified-clear retry grace.
 
 `successful_restore_attempt_seconds.txt` measures only the attempt that
 successfully reached all expected clients in `WorkerState::RUNNING`.

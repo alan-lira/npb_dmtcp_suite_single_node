@@ -12,6 +12,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/experiment_config.sh"
 
 ADAPTIVE_CLEANUP_HELPER="${SCRIPT_DIR}/adaptive_pre_restore_cleanup.py"
+RESTORE_PORT_RESERVATION_HELPER="${SCRIPT_DIR}/restore_port_reservation.py"
 
 usage() {
   cat <<USAGE
@@ -160,7 +161,8 @@ for positive_setting in \
   PRE_RESTORE_CLEANUP_TIMEOUT_SECONDS \
   PRE_RESTORE_CLEANUP_POLL_SECONDS \
   PRE_RESTORE_CLEANUP_REPORT_INTERVAL_SECONDS \
-  RESTORE_BIND_FAILURE_ABORT_SECONDS; do
+  RESTORE_BIND_FAILURE_ABORT_SECONDS \
+  RESTORE_PORT_RESERVATION_LOCK_TIMEOUT_SECONDS; do
   is_positive_number "${!positive_setting}" \
     || fail "${positive_setting} must be a positive number; received '${!positive_setting}'."
 done
@@ -177,8 +179,15 @@ done
 is_positive_integer "${RESTORE_MAX_ATTEMPTS}" \
   || fail "RESTORE_MAX_ATTEMPTS must be a positive integer; received '${RESTORE_MAX_ATTEMPTS}'."
 
+case "${RESTORE_RESERVE_ORIGINAL_TCP_PORTS}" in
+  true|false) ;;
+  *) fail "RESTORE_RESERVE_ORIGINAL_TCP_PORTS must be true or false." ;;
+esac
+
 [ -x "${ADAPTIVE_CLEANUP_HELPER}" ] \
   || fail "adaptive cleanup helper is missing or not executable: ${ADAPTIVE_CLEANUP_HELPER}"
+[ -x "${RESTORE_PORT_RESERVATION_HELPER}" ] \
+  || fail "restore port-reservation helper is missing or not executable: ${RESTORE_PORT_RESERVATION_HELPER}"
 python3 - <<'PY' \
   || fail "Python/Linux pidfd support is required for PID-reuse-safe cleanup escalation."
 import os
@@ -238,7 +247,7 @@ if ! verify_single_node_stack; then
   fail "the expected single-node DMTCP/MPICH stack is not active."
 fi
 
-for command_name in mpirun dmtcp_coordinator dmtcp_launch dmtcp_command python3 pgrep ps; do
+for command_name in mpirun dmtcp_coordinator dmtcp_launch dmtcp_command python3 pgrep ps flock; do
   command -v "${command_name}" >/dev/null 2>&1 \
     || fail "required command unavailable after sourcing ${ENV_FILE}: ${command_name}"
 done
@@ -326,6 +335,9 @@ COORD_PID=""
 RESTORED_PID=""
 PORT=""
 CLEANUP_DONE=0
+RESTORE_PORT_RESERVATION_ACTIVE=0
+RESTORE_PORT_RESERVATION_LOCK_FD=""
+RESTORE_PORT_RESERVATION_STATE="${RUN_DIR}/restore_port_reservation_state.json"
 EXPECTED_DMTCP_CLIENTS=$((NP + 2))
 
 now_ns() {
@@ -428,6 +440,89 @@ terminate_process_tree() {
   [ "${#ids[@]}" -eq 0 ] || kill "-${signal_name}" -- "${ids[@]}" 2>/dev/null || true
 }
 
+release_restore_ports() {
+  local release_status=0
+
+  if [ "${RESTORE_PORT_RESERVATION_ACTIVE}" -eq 1 ] && \
+     [ -f "${RESTORE_PORT_RESERVATION_STATE}" ]; then
+    phase restore "Restoring the previous net.ipv4.ip_local_reserved_ports value."
+    set +e
+    python3 "${RESTORE_PORT_RESERVATION_HELPER}" release \
+      --state "${RESTORE_PORT_RESERVATION_STATE}" \
+      --sysctl-path "${RESTORE_IP_LOCAL_RESERVED_PORTS_PATH}" \
+      --release-output "${RUN_DIR}/restore_port_reservation_released_value.txt" \
+      > "${RUN_DIR}/restore_port_reservation_release.log" 2>&1
+    release_status=$?
+    set -e
+    cat "${RUN_DIR}/restore_port_reservation_release.log" 2>/dev/null || true
+    if [ "${release_status}" -eq 0 ]; then
+      printf '%s\n' "RELEASED" > "${RUN_DIR}/restore_port_reservation_status.txt"
+      RESTORE_PORT_RESERVATION_ACTIVE=0
+    else
+      printf '%s\n' "RELEASE_FAILED" > "${RUN_DIR}/restore_port_reservation_status.txt"
+    fi
+  fi
+
+  if [ "${release_status}" -eq 0 ] && \
+     [ -n "${RESTORE_PORT_RESERVATION_LOCK_FD}" ]; then
+    flock -u "${RESTORE_PORT_RESERVATION_LOCK_FD}" 2>/dev/null || true
+    eval "exec ${RESTORE_PORT_RESERVATION_LOCK_FD}>&-"
+    RESTORE_PORT_RESERVATION_LOCK_FD=""
+  fi
+
+  return "${release_status}"
+}
+
+reserve_restore_ports() {
+  local lock_parent
+  local prepare_status
+
+  if [ "${RESTORE_RESERVE_ORIGINAL_TCP_PORTS}" = "false" ]; then
+    phase restore "Captured TCP-listener port reservation is disabled by configuration."
+    printf '%s\n' "DISABLED" > "${RUN_DIR}/restore_port_reservation_status.txt"
+    return 0
+  fi
+
+  [ -r "${RESTORE_IP_LOCAL_RESERVED_PORTS_PATH}" ] \
+    || fail "cannot read restore port-reservation sysctl: ${RESTORE_IP_LOCAL_RESERVED_PORTS_PATH}"
+  [ -w "${RESTORE_IP_LOCAL_RESERVED_PORTS_PATH}" ] \
+    || fail "cannot write restore port-reservation sysctl: ${RESTORE_IP_LOCAL_RESERVED_PORTS_PATH}; run with sufficient privilege or set RESTORE_RESERVE_ORIGINAL_TCP_PORTS=false for a deliberate comparison."
+
+  lock_parent="$(dirname -- "${RESTORE_PORT_RESERVATION_LOCK_FILE}")"
+  mkdir -p -- "${lock_parent}"
+  exec {RESTORE_PORT_RESERVATION_LOCK_FD}> "${RESTORE_PORT_RESERVATION_LOCK_FILE}"
+  if ! flock -w "${RESTORE_PORT_RESERVATION_LOCK_TIMEOUT_SECONDS}" \
+      "${RESTORE_PORT_RESERVATION_LOCK_FD}"; then
+    eval "exec ${RESTORE_PORT_RESERVATION_LOCK_FD}>&-"
+    RESTORE_PORT_RESERVATION_LOCK_FD=""
+    fail "timed out waiting for restore port-reservation lock: ${RESTORE_PORT_RESERVATION_LOCK_FILE}"
+  fi
+
+  phase restore "Reserving captured IPv4 TCP listener ports against temporary bind(port=0) allocation."
+  set +e
+  python3 "${RESTORE_PORT_RESERVATION_HELPER}" prepare \
+    --capture-state "${CLEANUP_STATE}" \
+    --state "${RESTORE_PORT_RESERVATION_STATE}" \
+    --sysctl-path "${RESTORE_IP_LOCAL_RESERVED_PORTS_PATH}" \
+    --ports-output "${RUN_DIR}/restore_reserved_tcp_listener_ports.txt" \
+    --original-output "${RUN_DIR}/restore_port_reservation_original_value.txt" \
+    --applied-output "${RUN_DIR}/restore_port_reservation_applied_value.txt" \
+    > "${RUN_DIR}/restore_port_reservation_prepare.log" 2>&1
+  prepare_status=$?
+  set -e
+  cat "${RUN_DIR}/restore_port_reservation_prepare.log"
+  if [ "${prepare_status}" -ne 0 ]; then
+    printf '%s\n' "PREPARE_FAILED" > "${RUN_DIR}/restore_port_reservation_status.txt"
+    flock -u "${RESTORE_PORT_RESERVATION_LOCK_FD}" 2>/dev/null || true
+    eval "exec ${RESTORE_PORT_RESERVATION_LOCK_FD}>&-"
+    RESTORE_PORT_RESERVATION_LOCK_FD=""
+    fail "could not reserve captured TCP listener ports before restore."
+  fi
+
+  RESTORE_PORT_RESERVATION_ACTIVE=1
+  printf '%s\n' "ACTIVE" > "${RUN_DIR}/restore_port_reservation_status.txt"
+}
+
 cleanup() {
   if [ "${CLEANUP_DONE}" -eq 1 ]; then
     return
@@ -451,6 +546,7 @@ cleanup() {
   for pid in "${RESTORED_PID}" "${APP_PID}" "${COORD_PID}"; do
     [ -z "${pid}" ] || wait "${pid}" 2>/dev/null || true
   done
+  release_restore_ports || true
   set -e
 }
 
@@ -1060,6 +1156,7 @@ PY
   echo "Binary: ${NPB_BIN}"
   echo "DMTCP commit: ${DMTCP_COMMIT:-unknown}"
   echo "DMTCP restore listener backlog: ${DMTCP_RESTORE_LISTEN_BACKLOG:-unknown}"
+  echo "DMTCP restore listener paths patched: ${DMTCP_RESTORE_LISTENER_PATHS:-unknown}"
   echo "DMTCP duplex stream refill patch: ${DMTCP_DUPLEX_REFILL_PATCH_ACTIVE:-unknown}"
   echo "DMTCP IPC plugin: ${DMTCP_IPC_PLUGIN_PATH:-unknown}"
   echo "DMTCP IPC plugin SHA256: ${DMTCP_IPC_PLUGIN_SHA256:-unknown}"
@@ -1078,6 +1175,10 @@ PY
   echo "Restore bind-failure abort seconds: ${RESTORE_BIND_FAILURE_ABORT_SECONDS}"
   echo "Restore maximum attempts: ${RESTORE_MAX_ATTEMPTS}"
   echo "Restore retry final verified-clear grace seconds: ${RESTORE_RETRY_FINAL_GRACE_SECONDS}"
+  echo "Reserve original TCP listener ports during restore: ${RESTORE_RESERVE_ORIGINAL_TCP_PORTS}"
+  echo "Restore port-reservation lock file: ${RESTORE_PORT_RESERVATION_LOCK_FILE}"
+  echo "Restore port-reservation lock timeout seconds: ${RESTORE_PORT_RESERVATION_LOCK_TIMEOUT_SECONDS}"
+  echo "Restore reserved-ports sysctl: ${RESTORE_IP_LOCAL_RESERVED_PORTS_PATH}"
 } > run_metadata.txt
 
 printf '%s\n' "${CHECKPOINT_MODE}" > checkpoint_mode.txt
@@ -1337,6 +1438,7 @@ phase cleanup "Adaptive pre-restore cleanup completed in $(human_seconds "$(<pre
 chmod +x "${RESTART_SCRIPT}"
 
 RESTORE_START_NS="$(now_ns)"
+reserve_restore_ports
 phase restore "Restoring checkpoints using script: ${RESTART_SCRIPT_ABS}"
 phase restore "The generated script will launch a new coordinator and restore ${EXPECTED_DMTCP_CLIENTS} DMTCP clients."
 phase restore "Up to ${RESTORE_MAX_ATTEMPTS} attempts will reuse this same checkpoint if a restore attempt stalls or exits before RUNNING."
@@ -1387,6 +1489,11 @@ if [ "${RESTORE_FOUND}" -ne 1 ] || [ "${SUCCESSFUL_RESTORE_ATTEMPT}" -le 0 ]; th
   echo "0" > dmtcp_restore_marker_found.txt
   echo "FAILED" > run_status.txt
   fail "all ${RESTORE_MAX_ATTEMPTS} restore attempts failed; checkpoint images and per-attempt diagnostics were preserved."
+fi
+
+if ! release_restore_ports; then
+  echo "FAILED" > run_status.txt
+  fail "restore succeeded, but the previous reserved-port setting could not be restored safely."
 fi
 
 RESTORE_END_NS="$(now_ns)"

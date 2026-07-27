@@ -58,6 +58,7 @@ NPB_CLASS="${NPB_CLASS:-D}"
 # Exact single-node stack preserved from the previously working package.
 WORKING_DMTCP_COMMIT="${WORKING_DMTCP_COMMIT:-6896e12276a9fe449edb0cf206203ce01b19efe6}"
 WORKING_DMTCP_RESTORE_LISTEN_BACKLOG="${WORKING_DMTCP_RESTORE_LISTEN_BACKLOG:-1024}"
+WORKING_DMTCP_RESTORE_LISTENER_PATHS="${WORKING_DMTCP_RESTORE_LISTENER_PATHS:-4}"
 WORKING_DMTCP_KERNELBUFFERDRAINER_SHA256="${WORKING_DMTCP_KERNELBUFFERDRAINER_SHA256:-c5d7b960220762b6a291f5a1aef5989786ed47c00318dcc78a8fb2b6db9cf04c}"
 WORKING_MPICH_VERSION="${WORKING_MPICH_VERSION:-5.0.0}"
 WORKING_MPICH_DEVICE="${WORKING_MPICH_DEVICE:-ch3:nemesis}"
@@ -169,6 +170,16 @@ RESTORE_MAX_ATTEMPTS="${RESTORE_MAX_ATTEMPTS:-3}"
 # applied only after all captured endpoints are verified reusable.
 RESTORE_RETRY_FINAL_GRACE_SECONDS="${RESTORE_RETRY_FINAL_GRACE_SECONDS:-10}"
 
+# Prevent DMTCP's temporary IPv4 restore listener (bind(port=0)) from being
+# assigned a captured original application listener port. The runner holds a
+# suite-wide lock, adds captured IPv4 TCP LISTEN ports to
+# net.ipv4.ip_local_reserved_ports for the complete restore-attempt sequence,
+# and restores the previous value afterward.
+RESTORE_RESERVE_ORIGINAL_TCP_PORTS="${RESTORE_RESERVE_ORIGINAL_TCP_PORTS:-true}"
+RESTORE_PORT_RESERVATION_LOCK_FILE="${RESTORE_PORT_RESERVATION_LOCK_FILE:-/run/lock/npb_dmtcp_restore_ports.lock}"
+RESTORE_PORT_RESERVATION_LOCK_TIMEOUT_SECONDS="${RESTORE_PORT_RESERVATION_LOCK_TIMEOUT_SECONDS:-30}"
+RESTORE_IP_LOCAL_RESERVED_PORTS_PATH="${RESTORE_IP_LOCAL_RESERVED_PORTS_PATH:-/proc/sys/net/ipv4/ip_local_reserved_ports}"
+
 POST_CHECKPOINT_STABILIZATION_SECONDS="${POST_CHECKPOINT_STABILIZATION_SECONDS:-2}"
 
 # Complete adaptive cleanup timeout, including exact-process shutdown, endpoint
@@ -241,17 +252,23 @@ verify_single_node_stack() {
   fi
 
   if [ "${DMTCP_RESTORE_BACKLOG_PATCH:-}" != "1" ] || \
-     [ "${DMTCP_RESTORE_LISTEN_BACKLOG:-}" != "${WORKING_DMTCP_RESTORE_LISTEN_BACKLOG}" ]; then
+     [ "${DMTCP_RESTORE_LISTEN_BACKLOG:-}" != "${WORKING_DMTCP_RESTORE_LISTEN_BACKLOG}" ] || \
+     [ "${DMTCP_RESTORE_LISTENER_PATHS:-}" != "${WORKING_DMTCP_RESTORE_LISTENER_PATHS}" ]; then
     echo "ERROR: The active DMTCP installation does not contain the" >&2
     echo "required restore-listener backlog patch." >&2
     echo "  Required backlog: ${WORKING_DMTCP_RESTORE_LISTEN_BACKLOG}" >&2
     echo "  Active backlog:   ${DMTCP_RESTORE_LISTEN_BACKLOG:-unset}" >&2
+    echo "  Required listener paths: ${WORKING_DMTCP_RESTORE_LISTENER_PATHS}" >&2
+    echo "  Active listener paths:   ${DMTCP_RESTORE_LISTENER_PATHS:-unset}" >&2
     echo "Rebuild DMTCP with install_dmtcp_mpich_env.sh." >&2
     return 1
   fi
 
   if ! grep -Fxq \
       "dmtcp_restore_listen_backlog=${WORKING_DMTCP_RESTORE_LISTEN_BACKLOG}" \
+      "${DMTCP_MPICH_MANIFEST:-/nonexistent}" 2>/dev/null || \
+     ! grep -Fxq \
+      "dmtcp_restore_listener_paths=${WORKING_DMTCP_RESTORE_LISTENER_PATHS}" \
       "${DMTCP_MPICH_MANIFEST:-/nonexistent}" 2>/dev/null; then
     echo "ERROR: The build manifest does not verify the required" >&2
     echo "DMTCP restore-listener backlog patch." >&2

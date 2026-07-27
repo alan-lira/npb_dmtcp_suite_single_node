@@ -187,6 +187,7 @@ def main() -> int:
                 "RESTORE_MAX_ATTEMPTS": "2",
                 "RESTORE_RETRY_FINAL_GRACE_SECONDS": "0",
                 "RESTORE_BIND_FAILURE_ABORT_SECONDS": "1",
+                "RESTORE_RESERVE_ORIGINAL_TCP_PORTS": "false",
                 "PRE_RESTORE_CLEANUP_TIMEOUT_SECONDS": "10",
                 "PRE_RESTORE_CLEANUP_POLL_SECONDS": "0.05",
                 "PRE_RESTORE_FORCE_KILL_AFTER_SECONDS": "0.2",

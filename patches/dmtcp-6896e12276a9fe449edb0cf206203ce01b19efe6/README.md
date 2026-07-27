@@ -12,8 +12,9 @@ A strict exact-substitution patch for:
 src/plugin/ipc/socket/connectionrewirer.cpp
 ```
 
-It changes the IPv6, Unix-stream, and Unix-seqpacket restore-listener backlogs
-from `32` to `1024`. Every `FROM` value must occur exactly once, every `TO`
+It changes the primary IPv4 `JServerSocket`, IPv6, Unix-stream, and
+Unix-seqpacket restore-listener backlogs from `32` to `1024`. Every `FROM`
+value must occur exactly once, every `TO`
 value must initially be absent, and all replacements are verified afterward.
 Any mismatch stops installation.
 
