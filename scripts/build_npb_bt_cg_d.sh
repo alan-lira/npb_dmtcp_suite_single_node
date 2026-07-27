@@ -66,15 +66,11 @@ mkdir -p "${BINARY_ROOT}"
 cd "${NPB_ROOT}"
 cp config/make.def.template config/make.def
 
-# NPB 3.4 uses MPIFC. Updating MPIF77 as well keeps the script compatible with
-# older templates that still use the previous variable name.
+# NPB 3.4 uses MPIFC and MPICC.
 if grep -Eq '^[[:space:]]*MPIFC[[:space:]]*=' config/make.def; then
   sed -i 's|^[[:space:]]*MPIFC[[:space:]]*=.*|MPIFC = mpifort|' config/make.def
 fi
 
-if grep -Eq '^[[:space:]]*MPIF77[[:space:]]*=' config/make.def; then
-  sed -i 's|^[[:space:]]*MPIF77[[:space:]]*=.*|MPIF77 = mpifort|' config/make.def
-fi
 
 if grep -Eq '^[[:space:]]*MPICC[[:space:]]*=' config/make.def; then
   sed -i 's|^[[:space:]]*MPICC[[:space:]]*=.*|MPICC = mpicc|' config/make.def

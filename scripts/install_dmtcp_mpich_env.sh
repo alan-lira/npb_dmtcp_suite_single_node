@@ -7,6 +7,9 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
+
 # ============================================================
 # Reproducible DMTCP + MPICH single-node environment
 #
@@ -34,17 +37,26 @@ MPICH_VER="${MPICH_VER:-5.0.0}"
 DMTCP_REF="${DMTCP_REF:-6896e12276a9fe449edb0cf206203ce01b19efe6}"
 
 WORKING_DMTCP_COMMIT="6896e12276a9fe449edb0cf206203ce01b19efe6"
+WORKING_DMTCP_RESTORE_LISTEN_BACKLOG="1024"
+WORKING_DMTCP_BACKLOG_PATCH_SHA256="5238eb9c961f03201de5de19e7c59cf1f3abd270c97588e2d3dca911ea65b7ad"
+WORKING_DMTCP_DUPLEX_PATCH_SHA256="f2c7baf517f7f7076a12e5703e36ab089b918b6aff72b544ddf1a59c46db897d"
+WORKING_DMTCP_KERNELBUFFERDRAINER_ORIGINAL_SHA256="1913813176868a6226245963b90b5976c802bc70dc3a924d2405c2375b5bf94d"
+WORKING_DMTCP_KERNELBUFFERDRAINER_PATCHED_SHA256="c5d7b960220762b6a291f5a1aef5989786ed47c00318dcc78a8fb2b6db9cf04c"
 WORKING_MPICH_VER="5.0.0"
 WORKING_MPICH_SHA256="e9350e32224283e95311f22134f36c98e3cd1c665d17fae20a6cc92ed3cffe11"
 
 ROOT_PREFIX="${ROOT_PREFIX:-${HOME}/opt}"
 BUILD_ROOT="${BUILD_ROOT:-${HOME}/build_dmtcp_mpich}"
+BUILD_JOBS="${BUILD_JOBS:-8}"
 
 AUTOCONF_PREFIX="${ROOT_PREFIX}/autoconf-${AUTOCONF_VER}"
 MPICH_PREFIX_VERSIONED="${ROOT_PREFIX}/mpich-${MPICH_VER}-ch3-nemesis-no-libudev"
 MPICH_PREFIX="${ROOT_PREFIX}/mpich-dmtcp"
 
 DMTCP_REPO="${DMTCP_REPO:-https://github.com/dmtcp/dmtcp.git}"
+DMTCP_PATCH_DIR="${REPO_ROOT}/patches/dmtcp-${WORKING_DMTCP_COMMIT}"
+DMTCP_BACKLOG_PATCH_FILE="${DMTCP_PATCH_DIR}/connectionrewirer-backlog-1024.exact.patch"
+DMTCP_DUPLEX_REFILL_PATCH_FILE="${DMTCP_PATCH_DIR}/kernelbufferdrainer-duplex-refill.patch"
 AUTOCONF_URL="https://ftp.gnu.org/gnu/autoconf/autoconf-${AUTOCONF_VER}.tar.xz"
 MPICH_URL="https://www.mpich.org/static/downloads/${MPICH_VER}/mpich-${MPICH_VER}.tar.gz"
 
@@ -81,6 +93,10 @@ echo "AUTOCONF_VER=${AUTOCONF_VER}"
 echo "MPICH_VER=${MPICH_VER}"
 echo "DMTCP_REF=${DMTCP_REF}"
 echo "DMTCP_REPO=${DMTCP_REPO}"
+echo "DMTCP_RESTORE_LISTEN_BACKLOG=${WORKING_DMTCP_RESTORE_LISTEN_BACKLOG}"
+echo "DMTCP_PATCH_DIR=${DMTCP_PATCH_DIR}"
+echo "DMTCP_BACKLOG_PATCH_FILE=${DMTCP_BACKLOG_PATCH_FILE}"
+echo "DMTCP_DUPLEX_REFILL_PATCH_FILE=${DMTCP_DUPLEX_REFILL_PATCH_FILE}"
 echo "============================================================"
 
 # ---------- Ubuntu build dependencies ----------
@@ -92,6 +108,7 @@ sudo apt install -y \
   git \
   m4 \
   perl \
+  patch \
   python3 \
   python3-venv \
   texinfo \
@@ -123,7 +140,7 @@ if [ ! -x "${AUTOCONF_PREFIX}/bin/autoconf" ]; then
 
   cd "autoconf-${AUTOCONF_VER}"
   ./configure --prefix="${AUTOCONF_PREFIX}"
-  make -j"$(nproc)"
+  make -j"${BUILD_JOBS}"
   make install
 
   cd "${BUILD_ROOT}"
@@ -183,6 +200,225 @@ if [ "${DMTCP_REF}" = "${WORKING_DMTCP_COMMIT}" ] && \
   exit 1
 fi
 
+DMTCP_CONNECTION_REWIRER_SOURCE="${PWD}/src/plugin/ipc/socket/connectionrewirer.cpp"
+DMTCP_KERNELBUFFERDRAINER_SOURCE="${PWD}/src/plugin/ipc/socket/kernelbufferdrainer.cpp"
+
+if [ ! -f "${DMTCP_CONNECTION_REWIRER_SOURCE}" ]; then
+  echo "ERROR: DMTCP connection rewirer source was not found:" >&2
+  echo "  ${DMTCP_CONNECTION_REWIRER_SOURCE}" >&2
+  exit 1
+fi
+
+if [ ! -f "${DMTCP_KERNELBUFFERDRAINER_SOURCE}" ]; then
+  echo "ERROR: DMTCP kernel buffer drainer source was not found:" >&2
+  echo "  ${DMTCP_KERNELBUFFERDRAINER_SOURCE}" >&2
+  exit 1
+fi
+
+DMTCP_RESTORE_BACKLOG_PATCH=0
+DMTCP_DUPLEX_REFILL_PATCH=0
+DMTCP_BACKLOG_PATCH_FILE_SHA256="not-applied"
+DMTCP_DUPLEX_REFILL_PATCH_FILE_SHA256="not-applied"
+DMTCP_CONNECTION_REWIRER_SHA256="$(
+  sha256sum "${DMTCP_CONNECTION_REWIRER_SOURCE}" | awk '{print $1}'
+)"
+DMTCP_KERNELBUFFERDRAINER_SHA256="$(
+  sha256sum "${DMTCP_KERNELBUFFERDRAINER_SOURCE}" | awk '{print $1}'
+)"
+
+if [ "${DMTCP_FULL_COMMIT}" = "${WORKING_DMTCP_COMMIT}" ]; then
+  echo "Applying the version-specific DMTCP patch bundle..."
+
+  for required_patch in \
+    "${DMTCP_BACKLOG_PATCH_FILE}" \
+    "${DMTCP_DUPLEX_REFILL_PATCH_FILE}"
+  do
+    if [ ! -f "${required_patch}" ]; then
+      echo "ERROR: Required DMTCP patch asset was not found:" >&2
+      echo "  ${required_patch}" >&2
+      exit 1
+    fi
+  done
+
+  DMTCP_BACKLOG_PATCH_FILE_SHA256="$(
+    sha256sum "${DMTCP_BACKLOG_PATCH_FILE}" | awk '{print $1}'
+  )"
+  if [ "${DMTCP_BACKLOG_PATCH_FILE_SHA256}" != \
+       "${WORKING_DMTCP_BACKLOG_PATCH_SHA256}" ]; then
+    echo "ERROR: DMTCP backlog patch checksum mismatch." >&2
+    echo "  Expected: ${WORKING_DMTCP_BACKLOG_PATCH_SHA256}" >&2
+    echo "  Actual:   ${DMTCP_BACKLOG_PATCH_FILE_SHA256}" >&2
+    exit 1
+  fi
+
+  DMTCP_DUPLEX_REFILL_PATCH_FILE_SHA256="$(
+    sha256sum "${DMTCP_DUPLEX_REFILL_PATCH_FILE}" | awk '{print $1}'
+  )"
+  if [ "${DMTCP_DUPLEX_REFILL_PATCH_FILE_SHA256}" != \
+       "${WORKING_DMTCP_DUPLEX_PATCH_SHA256}" ]; then
+    echo "ERROR: DMTCP duplex-refill patch checksum mismatch." >&2
+    echo "  Expected: ${WORKING_DMTCP_DUPLEX_PATCH_SHA256}" >&2
+    echo "  Actual:   ${DMTCP_DUPLEX_REFILL_PATCH_FILE_SHA256}" >&2
+    exit 1
+  fi
+
+  echo "Applying restore-listener backlog patch asset:"
+  echo "  ${DMTCP_BACKLOG_PATCH_FILE}"
+  python3 - \
+    "${DMTCP_CONNECTION_REWIRER_SOURCE}" \
+    "${DMTCP_BACKLOG_PATCH_FILE}" <<'PY'
+from pathlib import Path
+import sys
+
+source_path = Path(sys.argv[1])
+patch_path = Path(sys.argv[2])
+
+entries = []
+for line_number, raw_line in enumerate(patch_path.read_text().splitlines(), 1):
+    line = raw_line.strip()
+    if not line or line.startswith("#"):
+        continue
+    if "=" not in line:
+        raise SystemExit(
+            f"ERROR: malformed exact patch line {line_number}: {raw_line!r}"
+        )
+    kind, value = line.split("=", 1)
+    if kind not in {"FROM", "TO"}:
+        raise SystemExit(
+            f"ERROR: unsupported exact patch directive {kind!r} "
+            f"on line {line_number}."
+        )
+    entries.append((kind, value))
+
+if len(entries) != 6:
+    raise SystemExit(
+        f"ERROR: expected three FROM/TO pairs; found {len(entries)} directives."
+    )
+
+pairs = []
+for index in range(0, len(entries), 2):
+    from_kind, old = entries[index]
+    to_kind, new = entries[index + 1]
+    if from_kind != "FROM" or to_kind != "TO":
+        raise SystemExit(
+            "ERROR: exact patch directives must alternate FROM then TO."
+        )
+    if not old or not new or old == new:
+        raise SystemExit("ERROR: invalid empty or identical FROM/TO pair.")
+    pairs.append((old, new))
+
+text = source_path.read_text()
+for old, new in pairs:
+    old_count = text.count(old)
+    new_count = text.count(new)
+    if old_count != 1:
+        raise SystemExit(
+            f"ERROR: expected exactly one occurrence of {old!r}; "
+            f"found {old_count}."
+        )
+    if new_count != 0:
+        raise SystemExit(
+            f"ERROR: replacement {new!r} already occurs {new_count} time(s)."
+        )
+    text = text.replace(old, new, 1)
+
+for old, new in pairs:
+    if old in text or text.count(new) != 1:
+        raise SystemExit(
+            f"ERROR: post-application verification failed for {old!r}."
+        )
+
+source_path.write_text(text)
+PY
+
+  RESTORE_LISTEN_CALL_COUNT="$(
+    grep -Ec "_real_listen\\((ip6fd|udsfd|udsseqfd), ${WORKING_DMTCP_RESTORE_LISTEN_BACKLOG}\\)" \
+      "${DMTCP_CONNECTION_REWIRER_SOURCE}"
+  )"
+  if [ "${RESTORE_LISTEN_CALL_COUNT}" -ne 3 ]; then
+    echo "ERROR: DMTCP restore-listener backlog patch verification failed." >&2
+    grep -nE '_real_listen\((ip6fd|udsfd|udsseqfd),' \
+      "${DMTCP_CONNECTION_REWIRER_SOURCE}" >&2 || true
+    exit 1
+  fi
+  if grep -Eq '_real_listen\((ip6fd|udsfd|udsseqfd), 32\)' \
+      "${DMTCP_CONNECTION_REWIRER_SOURCE}"; then
+    echo "ERROR: At least one DMTCP restore listener still uses backlog 32." >&2
+    exit 1
+  fi
+  DMTCP_RESTORE_BACKLOG_PATCH=1
+  DMTCP_CONNECTION_REWIRER_SHA256="$(
+    sha256sum "${DMTCP_CONNECTION_REWIRER_SOURCE}" | awk '{print $1}'
+  )"
+  grep -nE '_real_listen\((ip6fd|udsfd|udsseqfd),' \
+    "${DMTCP_CONNECTION_REWIRER_SOURCE}"
+
+  echo "Applying nonblocking duplex stream-refill patch asset:"
+  echo "  ${DMTCP_DUPLEX_REFILL_PATCH_FILE}"
+  if [ "${DMTCP_KERNELBUFFERDRAINER_SHA256}" != \
+       "${WORKING_DMTCP_KERNELBUFFERDRAINER_ORIGINAL_SHA256}" ]; then
+    echo "ERROR: The checked-out kernelbufferdrainer.cpp does not match" >&2
+    echo "the validated source for the pinned DMTCP commit." >&2
+    echo "  Expected: ${WORKING_DMTCP_KERNELBUFFERDRAINER_ORIGINAL_SHA256}" >&2
+    echo "  Actual:   ${DMTCP_KERNELBUFFERDRAINER_SHA256}" >&2
+    exit 1
+  fi
+
+  patch --batch --forward --fuzz=0 -p1 \
+    < "${DMTCP_DUPLEX_REFILL_PATCH_FILE}"
+
+  DMTCP_KERNELBUFFERDRAINER_SHA256="$(
+    sha256sum "${DMTCP_KERNELBUFFERDRAINER_SOURCE}" | awk '{print $1}'
+  )"
+  if [ "${DMTCP_KERNELBUFFERDRAINER_SHA256}" != \
+       "${WORKING_DMTCP_KERNELBUFFERDRAINER_PATCHED_SHA256}" ]; then
+    echo "ERROR: DMTCP duplex stream-refill patch verification failed." >&2
+    echo "  Expected: ${WORKING_DMTCP_KERNELBUFFERDRAINER_PATCHED_SHA256}" >&2
+    echo "  Actual:   ${DMTCP_KERNELBUFFERDRAINER_SHA256}" >&2
+    exit 1
+  fi
+  if ! grep -Fq '#include <poll.h>' "${DMTCP_KERNELBUFFERDRAINER_SOURCE}"; then
+    echo "ERROR: poll support is missing from the patched source." >&2
+    exit 1
+  fi
+  if ! grep -Fq 'stream-refill payload send failed' \
+      "${DMTCP_KERNELBUFFERDRAINER_SOURCE}"; then
+    echo "ERROR: duplex-refill state machine marker is missing." >&2
+    exit 1
+  fi
+  DMTCP_DUPLEX_REFILL_PATCH=1
+else
+  echo "WARNING: Skipping the version-specific DMTCP patch bundle" >&2
+  echo "because DMTCP_REF does not resolve to the validated working commit." >&2
+fi
+
+echo "DMTCP restore-backlog patch:      ${DMTCP_RESTORE_BACKLOG_PATCH}"
+echo "DMTCP duplex stream-refill patch: ${DMTCP_DUPLEX_REFILL_PATCH}"
+echo "connectionrewirer.cpp SHA256:      ${DMTCP_CONNECTION_REWIRER_SHA256}"
+echo "kernelbufferdrainer.cpp SHA256:    ${DMTCP_KERNELBUFFERDRAINER_SHA256}"
+
+KERNEL_SOMAXCONN="$(cat /proc/sys/net/core/somaxconn)"
+if ! [[ "${KERNEL_SOMAXCONN}" =~ ^[0-9]+$ ]]; then
+  echo "ERROR: Could not read a numeric net.core.somaxconn value." >&2
+  exit 1
+fi
+
+if [ "${KERNEL_SOMAXCONN}" -lt "${WORKING_DMTCP_RESTORE_LISTEN_BACKLOG}" ]; then
+  echo "Increasing net.core.somaxconn from ${KERNEL_SOMAXCONN} to ${WORKING_DMTCP_RESTORE_LISTEN_BACKLOG}..."
+  sudo sysctl -w "net.core.somaxconn=${WORKING_DMTCP_RESTORE_LISTEN_BACKLOG}"
+  KERNEL_SOMAXCONN="$(cat /proc/sys/net/core/somaxconn)"
+fi
+
+if [ "${KERNEL_SOMAXCONN}" -lt "${WORKING_DMTCP_RESTORE_LISTEN_BACKLOG}" ]; then
+  echo "ERROR: net.core.somaxconn is smaller than the patched DMTCP restore backlog." >&2
+  echo "  Required minimum: ${WORKING_DMTCP_RESTORE_LISTEN_BACKLOG}" >&2
+  echo "  Active value:     ${KERNEL_SOMAXCONN}" >&2
+  exit 1
+fi
+
+echo "DMTCP restore-listener backlog: ${WORKING_DMTCP_RESTORE_LISTEN_BACKLOG}"
+echo "Kernel net.core.somaxconn:      ${KERNEL_SOMAXCONN}"
+
 echo "[6/9] Generating build system and building DMTCP..."
 
 # Some branches/tags include generated files, but using autoreconf keeps the
@@ -193,31 +429,33 @@ preserve_existing_path "${DMTCP_PREFIX_VERSIONED}"
 
 ./configure --prefix="${DMTCP_PREFIX_VERSIONED}"
 
-make -j"$(nproc)"
+make -j"${BUILD_JOBS}"
 make install
+
+DMTCP_IPC_PLUGIN="${DMTCP_PREFIX_VERSIONED}/lib/dmtcp/libdmtcp_ipc.so"
+if [ ! -f "${DMTCP_IPC_PLUGIN}" ]; then
+  echo "ERROR: Installed DMTCP IPC plugin was not found:" >&2
+  echo "  ${DMTCP_IPC_PLUGIN}" >&2
+  exit 1
+fi
+
+if [ "${DMTCP_DUPLEX_REFILL_PATCH}" = "1" ]; then
+  if ! grep -aFq 'stream-refill header receive failed' "${DMTCP_IPC_PLUGIN}"; then
+    echo "ERROR: Installed IPC plugin lacks the duplex-refill header marker." >&2
+    exit 1
+  fi
+  if ! grep -aFq 'stream-refill payload send failed' "${DMTCP_IPC_PLUGIN}"; then
+    echo "ERROR: Installed IPC plugin lacks the duplex-refill payload marker." >&2
+    exit 1
+  fi
+fi
+DMTCP_IPC_PLUGIN_SHA256="$(sha256sum "${DMTCP_IPC_PLUGIN}" | awk '{print $1}')"
 
 cd "${BUILD_ROOT}"
 
-# An installation made by the old script leaves ${DMTCP_PREFIX} as a real
-# directory. Preserve it before creating the generic symlink; ln -sfn cannot
-# replace a real directory and would otherwise create the link inside it.
 if [ -e "${DMTCP_PREFIX}" ] && [ ! -L "${DMTCP_PREFIX}" ]; then
-  LEGACY_DMTCP_BACKUP="${DMTCP_PREFIX}.legacy.$(date +%Y%m%d_%H%M%S)"
-  LEGACY_DMTCP_BACKUP_BASE="${LEGACY_DMTCP_BACKUP}"
-  LEGACY_DMTCP_BACKUP_INDEX=1
-
-  while [ -e "${LEGACY_DMTCP_BACKUP}" ] || [ -L "${LEGACY_DMTCP_BACKUP}" ]; do
-    LEGACY_DMTCP_BACKUP="${LEGACY_DMTCP_BACKUP_BASE}.${LEGACY_DMTCP_BACKUP_INDEX}"
-    LEGACY_DMTCP_BACKUP_INDEX=$((LEGACY_DMTCP_BACKUP_INDEX + 1))
-  done
-
-  echo "Existing non-symlink DMTCP installation detected:"
-  echo "  ${DMTCP_PREFIX}"
-  echo "Preserving it as:"
-  echo "  ${LEGACY_DMTCP_BACKUP}"
-  mv "${DMTCP_PREFIX}" "${LEGACY_DMTCP_BACKUP}"
+  preserve_existing_path "${DMTCP_PREFIX}"
 fi
-
 ln -sfn "${DMTCP_PREFIX_VERSIONED}" "${DMTCP_PREFIX}"
 
 if [ ! -L "${DMTCP_PREFIX}" ]; then
@@ -337,7 +575,7 @@ fi
 # Build first, then verify the generated private hwloc configuration header.
 # Checking for this header immediately after the top-level ./configure caused
 # false failures even though MPICH configuration itself had completed.
-make -j"$(nproc)"
+make -j"${BUILD_JOBS}"
 
 # Do not assume a single source-layout-dependent location. Detect the private
 # hwloc configuration header after the embedded component has been built.
@@ -377,7 +615,7 @@ fi
 ln -sfn "${MPICH_PREFIX_VERSIONED}" "${MPICH_PREFIX}"
 
 if [ "$(readlink -f "${MPICH_PREFIX}")" != "$(readlink -f "${MPICH_PREFIX_VERSIONED}")" ]; then
-  echo "ERROR: MPICH compatibility symlink points to an unexpected location." >&2
+  echo "ERROR: MPICH active symlink points to an unexpected location." >&2
   exit 1
 fi
 
@@ -388,7 +626,7 @@ DMTCP_MPICH_MANIFEST="${ROOT_PREFIX}/dmtcp_mpich_single_node_manifest.txt"
 
 {
   echo "profile=DMTCP_MPICH_SINGLE_NODE"
-  echo "profile_version=2"
+  echo "profile_version=5"
   echo "build_timestamp=$(date -Is)"
   echo "kernel=$(uname -srvo)"
   echo "gcc=$(gcc --version | head -n 1)"
@@ -399,6 +637,15 @@ DMTCP_MPICH_MANIFEST="${ROOT_PREFIX}/dmtcp_mpich_single_node_manifest.txt"
   echo "dmtcp_commit=${DMTCP_FULL_COMMIT}"
   echo "dmtcp_home=${DMTCP_PREFIX}"
   echo "dmtcp_versioned_home=${DMTCP_PREFIX_VERSIONED}"
+  echo "dmtcp_restore_listen_backlog=${WORKING_DMTCP_RESTORE_LISTEN_BACKLOG}"
+  echo "dmtcp_restore_backlog_patch=${DMTCP_RESTORE_BACKLOG_PATCH}"
+  echo "dmtcp_backlog_patch_file_sha256=${DMTCP_BACKLOG_PATCH_FILE_SHA256}"
+  echo "dmtcp_connectionrewirer_sha256=${DMTCP_CONNECTION_REWIRER_SHA256}"
+  echo "dmtcp_duplex_refill_patch=${DMTCP_DUPLEX_REFILL_PATCH}"
+  echo "dmtcp_duplex_patch_file_sha256=${DMTCP_DUPLEX_REFILL_PATCH_FILE_SHA256}"
+  echo "dmtcp_kernelbufferdrainer_sha256=${DMTCP_KERNELBUFFERDRAINER_SHA256}"
+  echo "dmtcp_ipc_plugin_sha256=${DMTCP_IPC_PLUGIN_SHA256}"
+  echo "kernel_net_core_somaxconn=${KERNEL_SOMAXCONN}"
   echo "dmtcp_launch_sha256=$(sha256sum "${DMTCP_PREFIX_VERSIONED}/bin/dmtcp_launch" | awk '{print $1}')"
   echo "mpich_version=${MPICH_VER}"
   echo "mpich_source_sha256=${ACTUAL_MPICH_SHA256}"
@@ -416,7 +663,12 @@ DMTCP_MPICH_MANIFEST="${ROOT_PREFIX}/dmtcp_mpich_single_node_manifest.txt"
 # ---------- Environment helper ----------
 echo "[9/9] Writing environment helper..."
 
-if [ "${DMTCP_FULL_COMMIT}" = "${WORKING_DMTCP_COMMIT}" ]; then
+if [ "${DMTCP_FULL_COMMIT}" = "${WORKING_DMTCP_COMMIT}" ] && \
+   [ "${WORKING_DMTCP_RESTORE_LISTEN_BACKLOG}" = "1024" ] && \
+   [ "${DMTCP_RESTORE_BACKLOG_PATCH}" = "1" ] && \
+   [ "${DMTCP_DUPLEX_REFILL_PATCH}" = "1" ] && \
+   [ "${DMTCP_KERNELBUFFERDRAINER_SHA256}" = \
+     "${WORKING_DMTCP_KERNELBUFFERDRAINER_PATCHED_SHA256}" ]; then
   DMTCP_SINGLE_NODE_PROFILE=1
 else
   DMTCP_SINGLE_NODE_PROFILE=0
@@ -432,6 +684,11 @@ export DMTCP_VERSIONED_HOME="${DMTCP_PREFIX_VERSIONED}"
 export DMTCP_REF="${DMTCP_REF}"
 export DMTCP_COMMIT="${DMTCP_FULL_COMMIT}"
 export DMTCP_SINGLE_NODE_PROFILE="${DMTCP_SINGLE_NODE_PROFILE}"
+export DMTCP_RESTORE_LISTEN_BACKLOG="${WORKING_DMTCP_RESTORE_LISTEN_BACKLOG}"
+export DMTCP_RESTORE_BACKLOG_PATCH="${DMTCP_RESTORE_BACKLOG_PATCH}"
+export DMTCP_DUPLEX_REFILL_PATCH="${DMTCP_DUPLEX_REFILL_PATCH}"
+export DMTCP_KERNELBUFFERDRAINER_SHA256="${DMTCP_KERNELBUFFERDRAINER_SHA256}"
+export DMTCP_IPC_PLUGIN_SHA256="${DMTCP_IPC_PLUGIN_SHA256}"
 export DMTCP_MPICH_MANIFEST="${DMTCP_MPICH_MANIFEST}"
 
 export MPICH_HOME="${MPICH_PREFIX}"
@@ -490,6 +747,11 @@ echo "MPICH_HOME:         ${MPICH_HOME}"
 echo "MPICH_VERSIONED:    ${MPICH_VERSIONED_HOME}"
 echo "AUTOCONF_HOME:      ${AUTOCONF_HOME}"
 echo "PROFILE:            ${DMTCP_SINGLE_NODE_PROFILE}"
+echo "RESTORE_BACKLOG:    ${DMTCP_RESTORE_LISTEN_BACKLOG}"
+echo "DUPLEX_REFILL:      ${DMTCP_DUPLEX_REFILL_PATCH}"
+echo "KBD_SHA256:         ${DMTCP_KERNELBUFFERDRAINER_SHA256}"
+echo "IPC_PLUGIN_SHA256:  ${DMTCP_IPC_PLUGIN_SHA256}"
+echo "KERNEL_SOMAXCONN:   $(cat /proc/sys/net/core/somaxconn)"
 echo "MANIFEST:           ${DMTCP_MPICH_MANIFEST}"
 echo "MPICH_DEVICE:       ${MPICH_DEVICE}"
 echo "MPICH_HWLOC:        ${MPICH_HWLOC}"

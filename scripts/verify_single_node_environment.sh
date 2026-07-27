@@ -26,6 +26,13 @@ source "${ENV_FILE}"
 verify_single_node_stack \
   || fail "the exact working single-node DMTCP/MPICH stack is not active."
 
+python3 - <<'PY' \
+  || fail "Python/Linux pidfd support is required for safe cleanup escalation."
+import os
+import signal
+raise SystemExit(0 if hasattr(os, "pidfd_open") and hasattr(signal, "pidfd_send_signal") else 1)
+PY
+
 read -r EPHEMERAL_PORT_MIN EPHEMERAL_PORT_MAX \
   < /proc/sys/net/ipv4/ip_local_port_range
 
@@ -42,6 +49,11 @@ echo "Single-node DMTCP/MPICH environment: VERIFIED"
 echo "============================================================"
 echo "DMTCP commit:          ${DMTCP_COMMIT}"
 echo "DMTCP executable:      $(readlink -f "$(command -v dmtcp_launch)")"
+echo "DMTCP restore backlog: ${DMTCP_RESTORE_LISTEN_BACKLOG}"
+echo "DMTCP duplex refill:   ${DMTCP_DUPLEX_REFILL_PATCH_ACTIVE}"
+echo "DMTCP IPC plugin:      ${DMTCP_IPC_PLUGIN_PATH}"
+echo "DMTCP IPC SHA256:      ${DMTCP_IPC_PLUGIN_SHA256}"
+echo "Kernel somaxconn:      $(cat /proc/sys/net/core/somaxconn)"
 echo "MPICH version:         ${MPICH_VERSION}"
 echo "MPICH device:          ${MPICH_DEVICE}"
 echo "MPICH hwloc libudev:   ${MPICH_HWLOC_LIBUDEV}"
@@ -53,7 +65,11 @@ echo "HWLOC_COMPONENTS:      ${HWLOC_COMPONENTS:-unset}"
 echo "MPIR_CVAR_ENABLE_GPU:  ${MPIR_CVAR_ENABLE_GPU:-unset}"
 echo "Coordinator lifecycle: ${COORDINATOR_LIFECYCLE}"
 echo "Coordinator port range:${DMTCP_PORT_MIN}-${DMTCP_PORT_MAX}"
-echo "Socket cleanup delay:  ${SOCKET_CLEANUP_SLEEP_SECONDS}s"
+echo "Pre-restore cleanup:   timeout=${PRE_RESTORE_CLEANUP_TIMEOUT_SECONDS}s, poll=${PRE_RESTORE_CLEANUP_POLL_SECONDS}s"
+echo "Cleanup escalation:    TERM after ${PRE_RESTORE_FORCE_KILL_AFTER_SECONDS}s, KILL ${PRE_RESTORE_FORCE_KILL_GRACE_SECONDS}s later"
+echo "Final verified grace:  ${PRE_RESTORE_FINAL_GRACE_SECONDS}s"
+echo "Bind-failure abort:    ${RESTORE_BIND_FAILURE_ABORT_SECONDS}s persistent"
+echo "PID-safe escalation:   Linux pidfd verified"
 echo "Ephemeral port range:  ${EPHEMERAL_PORT_MIN}-${EPHEMERAL_PORT_MAX}"
 echo "Kernel:                $(uname -srvo)"
 echo "C library:             $(ldd --version 2>&1 | head -n 1)"

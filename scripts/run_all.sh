@@ -8,18 +8,39 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
+TEST_DIR="${REPO_ROOT}/tests"
+
 # shellcheck source=experiment_config.sh
 source "${SCRIPT_DIR}/experiment_config.sh"
 
 for helper in \
   run_one.sh build_npb_bt_cg_d.sh install_npb_mpi.sh \
-  verify_single_node_environment.sh kill_dmtcp_processes.sh; do
+  verify_single_node_environment.sh kill_dmtcp_processes.sh \
+  adaptive_pre_restore_cleanup.py; do
   chmod +x "${SCRIPT_DIR}/${helper}"
+done
+
+for helper in \
+  test_adaptive_pre_restore_cleanup.py; do
+  chmod +x "${TEST_DIR}/${helper}"
 done
 
 fail() {
   echo "ERROR: $*" >&2
   exit 1
+}
+
+is_nonnegative_number() {
+  [[ "$1" =~ ^[0-9]+([.][0-9]+)?$ ]]
+}
+
+is_positive_number() {
+  is_nonnegative_number "$1" || return 1
+  python3 - "$1" <<'PY'
+import sys
+raise SystemExit(0 if float(sys.argv[1]) > 0 else 1)
+PY
 }
 
 if [ ! -f "${ENV_FILE}" ]; then
@@ -50,16 +71,34 @@ case "${CHECKPOINT_CLEANUP_MODE}" in
 esac
 
 case "${EXISTING_RUN_POLICY}" in
-  replace|skip|error)
+  resume|replace|error)
     ;;
   *)
-    fail "EXISTING_RUN_POLICY must be replace, skip, or error."
+    fail "EXISTING_RUN_POLICY must be resume, replace, or error."
     ;;
 esac
 
 if [ "${COORDINATOR_LIFECYCLE}" != "fresh" ]; then
   fail "this package intentionally uses the successful fresh-coordinator workflow."
 fi
+
+for positive_setting in \
+  PRE_RESTORE_CLEANUP_TIMEOUT_SECONDS \
+  PRE_RESTORE_CLEANUP_POLL_SECONDS \
+  PRE_RESTORE_CLEANUP_REPORT_INTERVAL_SECONDS \
+  RESTORE_BIND_FAILURE_ABORT_SECONDS; do
+  is_positive_number "${!positive_setting}" \
+    || fail "${positive_setting} must be a positive number; received '${!positive_setting}'."
+done
+
+for nonnegative_setting in \
+  PRE_RESTORE_FORCE_KILL_AFTER_SECONDS \
+  PRE_RESTORE_FORCE_KILL_GRACE_SECONDS \
+  PRE_RESTORE_FINAL_GRACE_SECONDS \
+  RESTORE_RETRY_FINAL_GRACE_SECONDS; do
+  is_nonnegative_number "${!nonnegative_setting}" \
+    || fail "${nonnegative_setting} must be a nonnegative number; received '${!nonnegative_setting}'."
+done
 
 if [ "${#BENCHMARKS[@]}" -eq 0 ] || \
    [ "${#MPI_RANKS[@]}" -eq 0 ] || \
@@ -72,6 +111,9 @@ fi
 
 [[ "${CR_REPETITIONS}" =~ ^[1-9][0-9]*$ ]] \
   || fail "CR_REPETITIONS must be a positive integer; received '${CR_REPETITIONS}'."
+
+[[ "${RESTORE_MAX_ATTEMPTS}" =~ ^[1-9][0-9]*$ ]] \
+  || fail "RESTORE_MAX_ATTEMPTS must be a positive integer; received '${RESTORE_MAX_ATTEMPTS}'."
 
 mkdir -p "${RESULTS_ROOT}"
 RESULTS_ROOT="$(cd -- "${RESULTS_ROOT}" && pwd)"
@@ -123,10 +165,10 @@ repetition_count = int(sys.argv[5])
 values = []
 for repetition in range(1, repetition_count + 1):
     run_dir = results_root / f"{benchmark}{npb_class}_np{np}_baseline_rep{repetition}"
-    status_file = run_dir / "run_status.txt"
+    success_marker = run_dir / "SUCCESS.marker"
     total_file = run_dir / "total_seconds.txt"
 
-    if not status_file.exists() or status_file.read_text().strip() != "SUCCESS":
+    if not success_marker.is_file():
         raise SystemExit(f"incomplete baseline run: {run_dir}")
     if not total_file.exists():
         raise SystemExit(f"missing baseline timing: {total_file}")
@@ -163,8 +205,14 @@ echo "Existing-run policy:    ${EXISTING_RUN_POLICY}"
 echo "Checkpoint cleanup:     ${CHECKPOINT_CLEANUP_MODE}"
 echo "Coordinator lifecycle:  ${COORDINATOR_LIFECYCLE} (--exit-on-last)"
 echo "Coordinator port range: ${DMTCP_PORT_MIN}-${DMTCP_PORT_MAX}"
-echo "Socket cleanup delay:   ${SOCKET_CLEANUP_SLEEP_SECONDS}s"
+echo "Pre-restore cleanup:     timeout=${PRE_RESTORE_CLEANUP_TIMEOUT_SECONDS}s, poll=${PRE_RESTORE_CLEANUP_POLL_SECONDS}s"
+echo "Cleanup escalation:      TERM after ${PRE_RESTORE_FORCE_KILL_AFTER_SECONDS}s, KILL ${PRE_RESTORE_FORCE_KILL_GRACE_SECONDS}s later"
+echo "Final verified grace:    ${PRE_RESTORE_FINAL_GRACE_SECONDS}s"
+echo "Bind-failure abort:      ${RESTORE_BIND_FAILURE_ABORT_SECONDS}s persistent"
+echo "Restore attempts:        ${RESTORE_MAX_ATTEMPTS} maximum from the same checkpoint"
+echo "Retry verified grace:    ${RESTORE_RETRY_FINAL_GRACE_SECONDS}s"
 echo "DMTCP commit:           ${DMTCP_COMMIT}"
+echo "DMTCP restore backlog:  ${DMTCP_RESTORE_LISTEN_BACKLOG} (kernel somaxconn $(cat /proc/sys/net/core/somaxconn))"
 echo "MPICH:                  ${MPICH_VERSION} (${MPICH_DEVICE}, libudev ${MPICH_HWLOC_LIBUDEV})"
 echo "DMTCP signal:           ${DMTCP_EXPERIMENT_SIGNAL}"
 echo "Output root:            ${OUTPUT_ROOT}"

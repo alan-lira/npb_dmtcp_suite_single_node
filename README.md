@@ -1,651 +1,628 @@
 # Single-node NPB + DMTCP checkpoint/restart experiments
 
 This repository runs reproducible single-node checkpoint/restart experiments
-with DMTCP, MPICH, and the NAS Parallel Benchmarks.
+with NAS Parallel Benchmarks (NPB-MPI), MPICH, and DMTCP.
 
-Supported defaults:
+The validated software profile is:
 
-- **BT, Class D** — MPI ranks must be a perfect square: `1, 4, 9, 16, 25, ...`;
-- **CG, Class D** — MPI ranks must be a power of two: `1, 2, 4, 8, 16, ...`.
+- DMTCP commit `6896e12276a9fe449edb0cf206203ce01b19efe6`;
+- DMTCP restore-listener backlog patched from `32` to `1024` for IPv6,
+  Unix-stream, and Unix-seqpacket restore sockets;
+- DMTCP stream-buffer refill replaced with a nonblocking duplex state machine
+  to prevent symmetric refill deadlocks when both MPI peers restore large
+  buffered payloads;
+- Linux `net.core.somaxconn` verified at `1024` or greater;
+- MPICH `5.0.0` using `ch3:nemesis`;
+- MPICH embedded hwloc built without libudev;
+- NPB-MPI `3.4`, Class `D`.
 
-The checkpoint/restart path considers the following sequence:
+The supported benchmarks and rank constraints are:
 
-1. Start a fresh coordinator with `--exit-on-last`;
-2. Launch `mpirun` through `dmtcp_launch`;
-3. Request the checkpoint;
-4. Wait for all checkpoint images and the generated restart script;
-5. Kill the original DMTCP computation and let the coordinator exit;
-6. Wait for operating-system socket cleanup;
-7. Execute the generated restart script without extra coordinator arguments;
-8. Wait until every DMTCP client reports `WorkerState::RUNNING`;
-9. Wait for NPB completion and verify `Verification = SUCCESSFUL`.
+- **BT.D**: the MPI rank count must be a perfect square, such as
+  `1, 4, 9, 16, 25, 36, 49, ...`;
+- **CG.D**: the MPI rank count must be a power of two, such as
+  `1, 2, 4, 8, 16, 32, 64, ...`.
+
+## Validated checkpoint/restart workflow
+
+Every experiment that is actually executed begins by running
+`scripts/kill_dmtcp_processes.sh`. This removes abandoned DMTCP, Hydra, MPI,
+and NPB processes from an unsuccessful previous run before a new baseline or
+checkpoint/restart run starts.
+
+Checkpoint/restart experiments then use this sequence:
+
+1. Start a fresh DMTCP coordinator with `--exit-on-last`.
+2. Launch `mpirun` through `dmtcp_launch`.
+3. Wait for the configured checkpoint target.
+4. Request a checkpoint and verify all checkpoint images and the generated
+   restart script.
+5. Capture the exact original process tree using PID and `/proc` start time.
+6. Capture the TCP, UDP, and Unix endpoints owned by that process tree.
+7. Stop the original DMTCP computation and allow the coordinator to exit.
+8. Adaptively wait for captured processes to disappear and captured endpoints
+   to become reusable.
+9. Apply the configured final grace interval only after all endpoints are
+   verified clear.
+10. Execute the generated DMTCP restart script without extra coordinator
+    arguments.
+11. Wait until every expected DMTCP client reports `WorkerState::RUNNING`.
+12. If the restore stalls, reports persistent bind errors, or exits before all
+    clients are running, preserve per-attempt diagnostics, clean the failed
+    restored process tree and endpoints, and retry the same checkpoint.
+13. Continue from the first successful restore attempt.
+14. Wait for NPB completion and require `Verification = SUCCESSFUL`.
+15. Create `SUCCESS.marker` atomically.
 
 The runner does not use `--ckpt-open-files` and does not reuse the original
 coordinator during restart.
 
-### Repository structure
+## Repository structure
 
 ```text
+patches/
+  dmtcp-6896e12276a9fe449edb0cf206203ce01b19efe6/
+    README.md
+    connectionrewirer-backlog-1024.exact.patch
+    kernelbufferdrainer-duplex-refill.patch
 scripts/
+  adaptive_pre_restore_cleanup.py
+  build_npb_bt_cg_d.sh
+  check_repository.sh
+  experiment_config.sh
   install_dmtcp_mpich_env.sh
   install_npb_mpi.sh
-  build_npb_bt_cg_d.sh
-  verify_single_node_environment.sh
-  run_one.sh
-  run_all.sh
-  summarize_results.py
   kill_dmtcp_processes.sh
-  check_repository.sh
-output/                         # Generated; ignored by Git
+  run_all.sh
+  run_one.sh
+  summarize_results.py
+  verify_single_node_environment.sh
+
+tests/
+  test_adaptive_pre_restore_cleanup.py
+  test_repository_contract.py
+  test_restore_retry.py
+  test_run_resume.py
+  test_summarize_results.py
+
+output/                         # generated; ignored by Git
   binaries/
   results/
 ```
 
-### 1. Prepare the repository
+## 1. Check the repository
 
 From the repository root:
 
 ```bash
-chmod +x scripts/*.sh scripts/summarize_results.py
+chmod +x scripts/*.sh scripts/*.py tests/*.py
 ./scripts/check_repository.sh
 ```
 
-### 2. Install DMTCP and MPICH
+The checker validates Bash and Python syntax, executable permissions, both
+version-specific DMTCP patch assets and their checksums, the current
+output-artifact contract, success-marker/resume integration, pre-run cleanup
+integration, and the controlled tests under `tests/`.
+
+## 2. Install DMTCP and MPICH
 
 ```bash
 ./scripts/install_dmtcp_mpich_env.sh
 ```
 
-The installer writes the environment helper to:
+The installer:
+
+1. installs the required Ubuntu build dependencies;
+2. builds local Autoconf `2.72`;
+3. checks out the exact DMTCP commit;
+4. verifies the checksums of both files in the commit-specific patch bundle;
+5. applies `connectionrewirer-backlog-1024.exact.patch`, changing exactly these
+   three restore listeners from backlog `32` to `1024`:
+
+   ```cpp
+   _real_listen(ip6fd, 1024)
+   _real_listen(udsfd, 1024)
+   _real_listen(udsseqfd, 1024)
+   ```
+
+6. applies `kernelbufferdrainer-duplex-refill.patch` as a strict unified diff
+   with `--forward`, zero fuzz, and no interactive patch decisions;
+7. verifies the patched source contents and the final
+   `kernelbufferdrainer.cpp` checksum;
+8. verifies or raises `net.core.somaxconn` to at least `1024`;
+9. builds DMTCP and verifies that the installed `libdmtcp_ipc.so` contains the
+   duplex-refill implementation markers;
+10. builds MPICH `5.0.0` with `ch3:nemesis` and embedded hwloc without libudev;
+11. writes a reproducibility manifest and environment helper, including the
+    patch-file and patched-source checksums.
+
+### Version-specific DMTCP patch bundle
+
+Both local DMTCP modifications are stored together under the exact commit to
+which they apply:
+
+```text
+patches/dmtcp-6896e12276a9fe449edb0cf206203ce01b19efe6/
+```
+
+`connectionrewirer-backlog-1024.exact.patch` is a deliberately small exact
+substitution patch. Its three `FROM` values must each occur exactly once and
+its three `TO` values must not already exist; otherwise installation stops
+without modifying the source. This avoids silently applying the backlog change
+to an unexpected DMTCP source layout.
+
+`kernelbufferdrainer-duplex-refill.patch` is a standard unified diff. The
+installer first verifies the pinned original source checksum, applies the diff
+with zero fuzz, and then verifies the complete patched-source checksum and
+state-machine markers.
+
+The patch directory name, asset checksums, source checksums, and strict
+application checks prevent either modification from being reused silently with
+a different DMTCP revision.
+
+The environment helper is written to:
 
 ```text
 ~/opt/enable_dmtcp_mpich_env.sh
 ```
 
-The generated helper and the experiment configuration both default to DMTCP
-checkpoint signal `30`. Individual experiment commands may override it with
-`DMTCP_EXPERIMENT_SIGNAL=<signal>`.
+### Build parallelism
 
-The default build and installation locations can be changed:
+Compilation uses eight parallel jobs by default to avoid memory exhaustion on
+machines with many CPU cores:
+
+```bash
+BUILD_JOBS=8 ./scripts/install_dmtcp_mpich_env.sh
+```
+
+Use a smaller value on a memory-constrained machine:
+
+```bash
+BUILD_JOBS=4 ./scripts/install_dmtcp_mpich_env.sh
+```
+
+Custom installation/build roots are supported:
 
 ```bash
 ROOT_PREFIX=/opt/my-dmtcp-stack \
 BUILD_ROOT=/scratch/my-dmtcp-build \
+BUILD_JOBS=8 \
 ./scripts/install_dmtcp_mpich_env.sh
 ```
 
-Use the same `ENV_FILE` override in later commands when `ROOT_PREFIX` is
-changed.
+Use the matching `ENV_FILE` override in later commands when the environment
+helper is not at its default path.
 
-### 3. Download NPB-MPI
+## 3. Install NPB-MPI
 
 ```bash
 ./scripts/install_npb_mpi.sh
 ```
 
-Default source path:
+The default source location is:
 
 ```text
 ~/NPB3.4-MPI
 ```
 
-Custom source path:
+A different location can be selected with:
 
 ```bash
 NPB_TARGET=/scratch/NPB3.4-MPI ./scripts/install_npb_mpi.sh
 ```
 
-Use the matching `NPB_ROOT` value when building.
+Use the same path through `NPB_ROOT` when building the benchmarks.
 
-
-### 4. Choose the output path
-
-By default, all generated repository artifacts are stored outside `scripts/`,
-under the repository-root `output/` directory:
-
-```text
-<repository-root>/output/
-├── binaries/
-└── results/
-    └── <run-name>/
-```
-
-The default output root is the repository-local `output/` directory and does
-not require an environment-variable override:
-
-```text
-<repository-root>/output/
-```
-
-All generated repository artifacts can instead be redirected with **one
-variable**:
-
-```bash
-OUTPUT_ROOT=/scratch/npb-dmtcp-output
-```
-
-Its layout is:
-
-```text
-$OUTPUT_ROOT/binaries/
-$OUTPUT_ROOT/results/<run-name>/
-```
-
-Each run directory contains logs, metrics, DMTCP restart scripts, and, when
-`keep-checkpoints` is selected, the checkpoint files themselves.
-
-To use the default repository-local output path for one command:
-
-```bash
-./scripts/run_all.sh
-```
-
-To use a custom output path for the same command:
-
-```bash
-OUTPUT_ROOT=/scratch/npb-dmtcp-output \
-./scripts/run_all.sh
-```
-
-To use the default repository-local output path for multiple commands, run
-them normally:
-
-```bash
-./scripts/build_npb_bt_cg_d.sh
-./scripts/verify_single_node_environment.sh
-./scripts/run_all.sh
-```
-
-To use the same custom output path for multiple commands in the current shell,
-export `OUTPUT_ROOT` first and then run the same commands:
-
-```bash
-export OUTPUT_ROOT=/scratch/npb-dmtcp-output
-
-./scripts/build_npb_bt_cg_d.sh
-./scripts/verify_single_node_environment.sh
-./scripts/run_all.sh
-```
-
-`BINARY_ROOT` and `RESULTS_ROOT` may be overridden separately when needed:
-
-```bash
-BINARY_ROOT=/opt/npb-binaries \
-RESULTS_ROOT=/scratch/npb-results \
-./scripts/run_one.sh bt 25 cr delay 60 1 keep-checkpoints
-```
-
-Use absolute paths for external output locations.
-
-When no output-path variables are set, the default generated paths are:
-
-```text
-<repository-root>/output/binaries/
-<repository-root>/output/results/
-```
-
-The repository-root `.gitignore` file should contain:
-
-```gitignore
-/output/
-```
-
-### 5. Build BT.D and CG.D
-
-Default output location:
+## 4. Build BT.D and CG.D
 
 ```bash
 ./scripts/build_npb_bt_cg_d.sh
 ```
 
-Custom output location:
+Custom example:
 
 ```bash
 OUTPUT_ROOT=/scratch/npb-dmtcp-output \
 NPB_ROOT=/scratch/NPB3.4-MPI \
+BENCHMARKS_TEXT="bt cg" \
+MPI_RANKS_TEXT="16 25 36" \
 ./scripts/build_npb_bt_cg_d.sh
 ```
 
-Then verify the environment and binary linkage.
+The rank list is recorded in the build manifest, but a benchmark executable is
+not built separately for each rank count.
 
-With the default repository-local output path:
+Verify the active stack and binary linkage:
 
 ```bash
 ./scripts/verify_single_node_environment.sh
 ```
 
-With a custom output path, use the same `OUTPUT_ROOT` value used during the build:
+## 5. Output location
 
-```bash
-OUTPUT_ROOT=/scratch/npb-dmtcp-output \
-./scripts/verify_single_node_environment.sh
+The default generated layout is:
+
+```text
+<repository>/output/
+├── binaries/
+└── results/
+    ├── per_run_results.csv
+    ├── aggregate_results.csv
+    └── <run-name>/
 ```
 
-### 6. Run a single experiment
-
-Baseline syntax:
+Redirect all generated artifacts with one variable:
 
 ```bash
-./scripts/run_one.sh <bt|cg> <mpi-ranks> baseline <rep> \
+OUTPUT_ROOT=/scratch/npb-dmtcp-output ./scripts/run_all.sh
+```
+
+`BINARY_ROOT` and `RESULTS_ROOT` can be set independently when required.
+Absolute paths are recommended for external locations.
+
+## 6. Run one experiment
+
+### Baseline
+
+```bash
+./scripts/run_one.sh <bt|cg> <mpi-ranks> baseline <repetition> \
   [delete-checkpoints|keep-checkpoints]
 ```
 
-Checkpoint/restart runs support two mutually exclusive target modes.
+Example:
 
-Percentage mode:
+```bash
+./scripts/run_one.sh bt 36 baseline 1 keep-checkpoints
+```
+
+### Percentage-target checkpoint/restart
 
 ```bash
 ./scripts/run_one.sh <bt|cg> <mpi-ranks> cr percent \
-  <checkpoint-percent> <rep> \
+  <checkpoint-percentage> <repetition> \
   [delete-checkpoints|keep-checkpoints]
 ```
 
-Direct-delay mode:
+Example:
+
+```bash
+./scripts/run_one.sh bt 36 cr percent 30 1 keep-checkpoints
+```
+
+Percentage mode requires at least one matching successful baseline marked by
+`SUCCESS.marker`, unless `BASELINE_REFERENCE_SECONDS=<seconds>` is explicitly
+provided.
+
+### Direct-delay checkpoint/restart
 
 ```bash
 ./scripts/run_one.sh <bt|cg> <mpi-ranks> cr delay \
-  <checkpoint-delay-seconds> <rep> \
+  <checkpoint-delay-seconds> <repetition> \
   [delete-checkpoints|keep-checkpoints]
 ```
 
-BT.D baseline:
+Example:
 
 ```bash
-./scripts/run_one.sh bt 25 baseline 1 keep-checkpoints
+./scripts/run_one.sh cg 32 cr delay 60 1 keep-checkpoints
 ```
 
-BT.D checkpoint/restart at 10% of the matching baseline mean:
+## 7. Run an experiment matrix
 
-```bash
-./scripts/run_one.sh bt 25 cr percent 10 1 keep-checkpoints
-```
-
-Percentage mode requires at least one successful matching baseline run in the
-configured results directory. The script calculates the absolute checkpoint
-delay as:
-
-```text
-checkpoint delay = baseline mean × checkpoint percentage / 100
-```
-
-An explicit baseline value may be supplied instead of reading previous baseline
-results:
-
-```bash
-BASELINE_REFERENCE_SECONDS=1373.779475573 \
-./scripts/run_one.sh bt 25 cr percent 10 1 keep-checkpoints
-```
-
-BT.D checkpoint/restart with a direct 60-second delay:
-
-```bash
-./scripts/run_one.sh bt 25 cr delay 60 1 keep-checkpoints
-```
-
-CG.D checkpoint/restart with a direct 60-second delay:
-
-```bash
-./scripts/run_one.sh cg 8 cr delay 60 1 keep-checkpoints
-```
-
-With the default repository-local output path:
-
-```bash
-./scripts/run_one.sh bt 25 cr delay 60 1 keep-checkpoints
-```
-
-With a custom output path:
-
-```bash
-OUTPUT_ROOT=/scratch/npb-dmtcp-output \
-./scripts/run_one.sh bt 25 cr delay 60 1 keep-checkpoints
-```
-
-The `percent` and `delay` modes cannot be combined. Percentage-mode run
-directories use the percentage, for example `btD_np25_cr_p10_rep1`.
-Direct-delay run directories use the absolute delay, for example
-`btD_np25_cr_t60_rep1`.
-
-
-### 7. Run the configured experiment matrix
-
-`scripts/run_all.sh` executes a matrix of baseline and checkpoint/restart
-experiments. The default matrix is defined in
-`scripts/experiment_config.sh`:
-
-```bash
-BENCHMARKS_TEXT="bt cg"
-MPI_RANKS_TEXT="4"
-BASELINE_REPETITIONS="3"
-CR_REPETITIONS="3"
-CHECKPOINT_PERCENTAGES_TEXT="25 50 75"
-NPB_CLASS="D"
-SOCKET_CLEANUP_SLEEP_SECONDS="10"
-DMTCP_EXPERIMENT_SIGNAL="30"
-```
-
-`BASELINE_REPETITIONS` and `CR_REPETITIONS` are counts, not lists of
-repetition identifiers. A value of `1` runs one repetition, a value of `2`
-runs repetitions `1` and `2`, and a value of `3` runs repetitions `1`, `2`,
-and `3`. The repetition number remains part of each run-directory name.
-
-These settings mean that the suite will:
-
-- run both the **BT.D** and **CG.D** benchmarks;
-- use **4 MPI ranks** for each benchmark;
-- execute **3 baseline repetitions** (`rep1` through `rep3`) for each benchmark;
-- calculate a separate mean baseline duration for BT.D and CG.D;
-- request checkpoints at **25%, 50%, and 75%** of the corresponding baseline
-  mean;
-- execute **3 checkpoint/restart repetitions** (`rep1` through `rep3`) for each checkpoint percentage;
-- wait **10 seconds** for operating-system socket cleanup before each restore;
-- use signal **30** as the DMTCP checkpoint signal.
-
-For each benchmark and MPI-rank combination, the suite follows this order:
-
-```text
-1. Run all configured baseline repetitions.
-2. Verify the successful baseline runs.
-3. Calculate their mean duration.
-4. Convert each configured checkpoint percentage into an absolute delay:
-
-   checkpoint delay = baseline mean × checkpoint percentage / 100
-
-5. Run all configured checkpoint/restart repetitions for each percentage.
-6. Record checkpoint, restore, storage, runtime, and overhead metrics.
-```
-
-With the default configuration, the matrix expands to:
-
-```text
-BT.D with 4 MPI ranks:
-  3 baseline runs
-  3 checkpoint percentages × 3 repetitions = 9 checkpoint/restart runs
-  Total: 12 runs
-
-CG.D with 4 MPI ranks:
-  3 baseline runs
-  3 checkpoint percentages × 3 repetitions = 9 checkpoint/restart runs
-  Total: 12 runs
-
-Complete default matrix:
-  6 baseline runs
-  18 checkpoint/restart runs
-  Total: 24 runs
-```
-
-Each checkpoint percentage is calculated from the baseline mean of the same
-benchmark, NPB class, and MPI-rank count. For example, the BT.D baseline mean
-is not used to schedule a CG.D checkpoint.
-
-The configured MPI-rank values must be valid for every selected benchmark:
-
-- BT requires a perfect-square rank count: `1, 4, 9, 16, 25, ...`;
-- CG requires a power-of-two rank count: `1, 2, 4, 8, 16, ...`.
-
-When both `bt` and `cg` are selected, values such as `1`, `4`, and `16` are
-valid for both benchmarks.
-
-#### Small validation
-
-The following command performs a minimal validation using the default
-repository-local output path:
+Example for BT.D with 36 ranks, one baseline, one repetition at 30%, 50%, and
+80%, retaining checkpoints:
 
 ```bash
 BENCHMARKS_TEXT="bt" \
-MPI_RANKS_TEXT="25" \
-BASELINE_REPETITIONS="1" \
-CR_REPETITIONS="1" \
-CHECKPOINT_PERCENTAGES_TEXT="10" \
-CHECKPOINT_CLEANUP_MODE="keep-checkpoints" \
+MPI_RANKS_TEXT="36" \
+BASELINE_REPETITIONS=1 \
+CR_REPETITIONS=1 \
+CHECKPOINT_PERCENTAGES_TEXT="30 50 80" \
+CHECKPOINT_CLEANUP_MODE=keep-checkpoints \
 ./scripts/run_all.sh
 ```
 
-This command executes exactly two runs:
+The default existing-run policy is:
 
 ```text
-1. One BT.D baseline run with 25 MPI ranks.
-2. One BT.D checkpoint/restart run with the checkpoint requested at 10% of
-   the measured baseline duration.
+EXISTING_RUN_POLICY=resume
 ```
 
-For example, if the baseline duration is `750` seconds, the checkpoint target
-will be:
+Under `resume`:
+
+- a run directory containing `SUCCESS.marker` is skipped;
+- an existing directory without `SUCCESS.marker` is treated as incomplete,
+  removed, and rerun;
+- missing experiments are executed normally.
+
+This allows the same `run_all.sh` command to continue only the unfinished part
+of a matrix after an interruption.
+
+Other policies are:
 
 ```text
-750 × 10 / 100 = 75 seconds after launch
+EXISTING_RUN_POLICY=replace   # rerun every requested experiment
+EXISTING_RUN_POLICY=error     # stop if any requested run directory exists
 ```
 
-The same validation can be executed with a custom output path:
+`RUN_BASELINE=true` remains safe with the default `resume` policy: successful
+baseline repetitions are skipped, while missing or incomplete baseline
+repetitions are executed. Use `RUN_BASELINE=false` only when every requested
+baseline marker and timing file already exist.
+
+## Automatic restore retries
+
+The patched DMTCP IPC plugin removes the deterministic symmetric stream-buffer
+refill deadlock observed with CG.D. Independent transient restart failures still
+do not immediately fail the experiment: by default, the runner performs up to
+three restore attempts using the same set of checkpoint images:
+
+```text
+RESTORE_MAX_ATTEMPTS=3
+```
+
+After a failed attempt, the runner:
+
+1. preserves the attempt's stdout, stderr, DMTCP client list, socket snapshots,
+   process snapshots, and failure reason under `restore_attempts/`;
+2. captures the failed restored process tree and its endpoints;
+3. stops the failed restore and adaptively waits for those endpoints to become
+   reusable;
+4. runs the emergency process cleanup as a final verification;
+5. applies `RESTORE_RETRY_FINAL_GRACE_SECONDS` only after adaptive endpoint cleanup and the final process sweep;
+6. launches the unchanged generated restart script again from the same
+   checkpoint images.
+
+A retry does not create a new checkpoint. Checkpoint deletion still occurs only
+after the restored NPB application completes successfully and reports
+`Verification = SUCCESSFUL`.
+
+The retry mechanism remains a bounded fallback for failures other than the
+patched refill deadlock. If every configured attempt fails, the run fails and
+retains the checkpoint images and all attempt diagnostics.
+
+When an attempt reaches `RUNNING`, its canonical stdout/stderr files are copied
+once for live visibility and refreshed again after the restored application
+exits. Final NPB verification therefore reads the complete successful-attempt
+output rather than the early `RUNNING` snapshot.
+
+Example with five total attempts:
 
 ```bash
-OUTPUT_ROOT=/scratch/npb-dmtcp-output \
-BENCHMARKS_TEXT="bt" \
-MPI_RANKS_TEXT="25" \
-BASELINE_REPETITIONS="1" \
-CR_REPETITIONS="1" \
-CHECKPOINT_PERCENTAGES_TEXT="10" \
-CHECKPOINT_CLEANUP_MODE="keep-checkpoints" \
+RESTORE_MAX_ATTEMPTS=5 \
+RESTORE_RETRY_FINAL_GRACE_SECONDS=10 \
 ./scripts/run_all.sh
 ```
 
-The environment-variable values placed before `./scripts/run_all.sh` override
-the defaults only for that command. They do not modify
-`scripts/experiment_config.sh`.
+## Success marker
 
-When the same count should be used for both kinds of execution, the shorthand
-`REPETITIONS` may be used instead:
+A successful run contains:
+
+```text
+SUCCESS.marker
+```
+
+It is created only after:
+
+- the process exits successfully;
+- NPB reports `Verification = SUCCESSFUL`;
+- all required metrics and the execution summary are written.
+
+Example contents:
+
+```text
+status=SUCCESS
+run_name=btD_np36_cr_p30_rep1
+completed_at=2026-07-26T12:34:56+00:00
+npb_verification=SUCCESSFUL
+```
+
+`run_status.txt` remains a live/failure diagnostic file. `SUCCESS.marker` is
+the authoritative completion marker used by resume and summarization.
+
+## Pre-run process cleanup
+
+Every non-skipped experiment invokes:
 
 ```bash
-REPETITIONS=2 ./scripts/run_all.sh
+./scripts/kill_dmtcp_processes.sh
 ```
 
-This runs baseline repetitions `1` and `2`, followed by checkpoint/restart
-repetitions `1` and `2` for every configured checkpoint percentage.
-
-#### Full configured matrix
-
-Run the complete matrix currently defined in
-`scripts/experiment_config.sh`:
-
-```bash
-./scripts/run_all.sh
-```
-
-The suite always runs the required baseline repetitions before their
-percentage-based checkpoint/restart experiments. A checkpoint/restart run is
-not started when no successful matching baseline duration is available.
-
-
-### Execution messages
-
-A checkpoint/restart execution reports each phase explicitly:
+The output is stored as:
 
 ```text
-[coordinator] Starting a fresh DMTCP coordinator...
-[run] Launching BT.D with 25 MPI ranks under DMTCP.
-[checkpoint] Detected 27 DMTCP clients; creating checkpoint images now.
-[checkpoint] Checkpoint recorded successfully at ...
-[checkpoint] Checkpoint storage: ... GB total | ... GB mean per rank.
-[shutdown] Killing the original DMTCP clients...
-[shutdown] Original computation and coordinator terminated.
-[cleanup] Waiting 10 seconds for operating-system socket cleanup.
-[restore] Restoring checkpoints using script: ...
-[restore] Progress: 27/27 clients RUNNING.
-[restore] Restore complete; step took ... seconds.
-[run] Restored application is still running...
-[run] Still running; elapsed since latest restore: ... | since initial launch: ...
-[complete] NPB verification was SUCCESSFUL.
+pre_run_cleanup.log
 ```
 
-### Measurements
+The cleanup sends `TERM`, waits, sends `KILL` to remaining matching processes,
+and fails the new experiment if any matching DMTCP/MPI/NPB process still
+remains.
 
-Every successful run contains `execution_summary.txt`. For a
-checkpoint/restart execution with a matching baseline, the summary has the
-following form:
+The cleanup applies to matching processes owned by the current user. This
+suite is intended for one experiment at a time on a single node.
 
-```text
-Total duration: X seconds
-Size of checkpoints: Y1 GB total | Y2 GB mean per application rank
-Time required for the checkpoint step: X seconds
-Time required for the restore step: X seconds
-DMTCP checkpoint/restore workflow overhead: X seconds
-  Included phases: checkpoint X + post-checkpoint stabilization X + original shutdown X + socket cleanup X + restore X seconds
-Total DMTCP-related overhead: X seconds (... compared with baseline mean ...; complete DMTCP execution was X seconds faster/slower than the baseline)
-Residual DMTCP runtime difference: X seconds (execution outside the checkpoint/restore workflow was X seconds faster/slower than the baseline)
-```
+## Main configuration variables
 
-A baseline execution reports only its total duration and explicitly marks the
-DMTCP-specific measurements as unavailable:
+| Variable | Default | Purpose |
+|---|---:|---|
+| `BENCHMARKS_TEXT` | `bt cg` | Space-separated benchmark matrix |
+| `MPI_RANKS_TEXT` | `4` | Space-separated MPI-rank matrix |
+| `BASELINE_REPETITIONS` | `3` | Baseline repetitions |
+| `CR_REPETITIONS` | `3` | Repetitions per checkpoint target |
+| `CHECKPOINT_PERCENTAGES_TEXT` | `25 50 75` | Percentage targets |
+| `RUN_BASELINE` | `true` | Process baseline entries in the matrix |
+| `EXISTING_RUN_POLICY` | `resume` | Resume, replace, or error |
+| `CHECKPOINT_CLEANUP_MODE` | `delete-checkpoints` | Retain or delete checkpoint files |
+| `DMTCP_RESTORE_TIMEOUT_SECONDS` | `600` | Timeout applied independently to each restore attempt |
+| `RESTORE_MAX_ATTEMPTS` | `3` | Maximum attempts from the same checkpoint |
+| `RESTORE_RETRY_FINAL_GRACE_SECONDS` | `10` | Verified-clear grace before a retry |
+| `CHECKPOINT_FILE_TIMEOUT_SECONDS` | `600` | Checkpoint-image timeout |
+| `DMTCP_EXPERIMENT_SIGNAL` | `30` | DMTCP checkpoint signal |
+| `DMTCP_PORT_MIN` | `20000` | Random coordinator-port lower bound |
+| `DMTCP_PORT_MAX` | `39999` | Random coordinator-port upper bound |
+| `PRE_RESTORE_CLEANUP_TIMEOUT_SECONDS` | `180` | Complete adaptive cleanup timeout |
+| `PRE_RESTORE_CLEANUP_POLL_SECONDS` | `0.25` | Cleanup polling interval |
+| `PRE_RESTORE_FORCE_KILL_AFTER_SECONDS` | `10` | TERM escalation delay |
+| `PRE_RESTORE_FORCE_KILL_GRACE_SECONDS` | `5` | KILL escalation grace |
+| `PRE_RESTORE_FINAL_GRACE_SECONDS` | `2` | Grace after all endpoints are clear |
+| `PRE_RESTORE_CLEANUP_REPORT_INTERVAL_SECONDS` | `5` | Cleanup progress interval |
+| `RESTORE_BIND_FAILURE_ABORT_SECONDS` | `10` | Persistent bind-error abort threshold |
+| `PROGRESS_INTERVAL_SECONDS` | `30` | Application progress interval |
+| `RESTORE_PROGRESS_INTERVAL_SECONDS` | `5` | Restore progress interval |
 
-```text
-Total duration: X seconds
-Checkpoint/restore metrics: N/A (baseline execution; not run under DMTCP)
-```
+## Current run artifacts
 
-Definitions:
-
-- **Total duration:** original launch through completion of the restored run;
-- **Checkpoint time:** checkpoint request through visibility of all checkpoint
-  images and the generated restart script;
-- **Restore time:** restart-script launch until all expected DMTCP clients are
-  confirmed as `RUNNING`;
-- **Checkpoint total size:** all top-level `ckpt_*` files and associated
-  `ckpt_*` directories;
-- **Mean per rank:** checkpoint total size divided by the number of application
-  MPI ranks;
-- **DMTCP checkpoint/restore workflow overhead:** sum of the checkpoint step,
-  post-checkpoint stabilization, original-computation shutdown, socket-cleanup
-  delay, and restore step. The execution summary prints all five components so
-  this value is not confused with checkpoint time plus restore time alone;
-- **Total DMTCP-related overhead:** checkpoint/restart total duration minus the
-  mean of successful matching baseline runs. A positive value means that the
-  complete DMTCP execution was slower than the baseline; a negative value means
-  that it was faster;
-- **Residual DMTCP runtime difference:** total DMTCP-related overhead minus the
-  explicitly measured checkpoint/restore workflow overhead. This is a signed
-  difference, not a value clamped to zero:
-  - a positive value means that execution outside the checkpoint/restore
-    workflow was slower than the baseline;
-  - a negative value means that execution outside the checkpoint/restore
-    workflow was faster than the baseline;
-  - a value near zero means that no measurable difference was observed.
-
-Important metric files:
+Baseline directories contain only baseline-relevant output, including:
 
 ```text
+run_metadata.txt
+pre_run_cleanup.log
+stdout.log
+stderr.log
 total_seconds.txt
+baseline_reference_seconds.txt
+npb_verification_successful.txt
+execution_summary.txt
+run_status.txt
+SUCCESS.marker
+```
+
+Checkpoint/restart directories additionally contain current checkpoint,
+cleanup, restore, size, and overhead metrics, including:
+
+```text
+checkpoint_command_seconds.txt
+checkpoint_file_wait_seconds.txt
 checkpoint_seconds.txt
+checkpoint_size_bytes.txt
+checkpoint_size_gb.txt
+checkpoint_size_gib.txt
+checkpoint_mean_per_rank_gb.txt
+checkpoint_mean_per_rank_gib.txt
+checkpoint_image_count.txt
 post_checkpoint_stabilization_seconds.txt
+pre_restore_cleanup_seconds.txt
 original_shutdown_seconds.txt
-socket_cleanup_sleep_seconds.txt
+pre_restore_endpoint_verification_seconds.txt
+pre_restore_final_grace_seconds.txt
 dmtcp_restore_seconds.txt
+successful_restore_attempt_seconds.txt
+restore_attempt_count.txt
+restore_retry_count.txt
+restore_attempts_summary.tsv
+restore_attempts/
+post_dmtcp_restore_runtime_seconds.txt
 checkpoint_restore_workflow_overhead_seconds.txt
 total_dmtcp_related_overhead_seconds.txt
 total_dmtcp_related_overhead_percent.txt
 residual_dmtcp_runtime_difference_seconds.txt
-checkpoint_size_gb.txt
-checkpoint_mean_per_rank_gb.txt
-baseline_reference_seconds.txt
 execution_summary.txt
+run_status.txt
+SUCCESS.marker
 ```
 
-The following files are retained as backward-compatible aliases for existing
-analysis scripts and result directories:
+This version reads and writes only the current artifact names. Old alias files
+and old result-directory naming forms are not generated, resumed, or consumed.
+
+## Result definitions
+
+`total_seconds.txt` is complete elapsed workflow time from initial application
+launch until successful completion after restart.
+
+`checkpoint_seconds.txt` measures the checkpoint command plus the wait for all
+checkpoint images and the generated restart script.
+
+`pre_restore_cleanup_seconds.txt` measures the complete adaptive cleanup,
+including captured-process shutdown, endpoint verification, and the final
+verified-clear grace interval.
+
+`dmtcp_restore_seconds.txt` measures the complete restore phase from the first
+restart-script launch until one attempt reaches all expected DMTCP clients in
+`WorkerState::RUNNING`. It includes failed-attempt duration, retry cleanup, and
+the configured verified-clear retry grace.
+
+`successful_restore_attempt_seconds.txt` measures only the attempt that
+successfully reached all expected clients in `WorkerState::RUNNING`.
+
+`restore_attempt_count.txt` records the number of attempts executed, while
+`restore_retry_count.txt` records the number of retries. Per-attempt logs and
+diagnostics are stored below `restore_attempts/` and summarized in
+`restore_attempts_summary.tsv`.
+
+`checkpoint_restore_workflow_overhead_seconds.txt` is:
 
 ```text
-checkpoint_restore_procedure_overhead_seconds.txt
-residual_dmtcp_runtime_overhead_seconds.txt
-additional_overhead_seconds.txt
-additional_overhead_percent.txt
+checkpoint
++ post-checkpoint stabilization
++ adaptive pre-restore cleanup
++ restore
 ```
 
-A direct checkpoint/restart run without a matching successful baseline still
-records the DMTCP checkpoint/restore workflow overhead. The total DMTCP-related
-overhead and residual DMTCP runtime difference are recorded as `N/A` because
-they require a baseline reference.
-
-Baseline result directories retain zero-valued compatibility files for older
-analysis tools, but `execution_summary.txt`, `per_run_results.csv`, and
-`aggregate_results.csv` expose DMTCP-specific baseline metrics as `N/A`, since
-the baseline application is not launched under DMTCP.
-
-### Summaries
-
-The summarizer reads successful BT and CG runs, including baseline,
-percentage-target, and direct-delay directories. It uses the new metric names
-when available and falls back to the compatibility aliases for older result
-directories.
-
-With the default repository-local results path:
-
-```bash
-python3 scripts/summarize_results.py
-```
-
-This reads:
+`total_dmtcp_related_overhead_seconds.txt` is:
 
 ```text
-<repository-root>/output/results/
+complete checkpoint/restart workflow duration - matching baseline mean
 ```
 
-With a custom results path:
+`residual_dmtcp_runtime_difference_seconds.txt` is:
+
+```text
+total DMTCP-related overhead - measured checkpoint/restore workflow overhead
+```
+
+The residual is signed. A positive value means the DMTCP execution was slower
+outside the explicitly measured checkpoint/cleanup/restore phases; a negative
+value means it was faster over those remaining runtime portions.
+
+## Summaries
+
+Summarize the default results directory:
 
 ```bash
-python3 scripts/summarize_results.py \
+./scripts/summarize_results.py
+```
+
+Custom directory:
+
+```bash
+./scripts/summarize_results.py \
   --results-root /scratch/npb-dmtcp-output/results
 ```
 
-By default, the following files are written inside the selected results root:
+Only directories containing `SUCCESS.marker` are included. The script writes:
 
 ```text
 per_run_results.csv
 aggregate_results.csv
 ```
 
-A separate CSV destination may be selected without changing the input results
-path:
+## Tests
+
+Run all repository checks and controlled tests:
 
 ```bash
-python3 scripts/summarize_results.py \
-  --results-root /scratch/npb-dmtcp-output/results \
-  --output-dir /scratch/npb-dmtcp-summaries
+./scripts/check_repository.sh
 ```
 
-`per_run_results.csv` contains one row per successful repetition, including the
-workflow overhead, total DMTCP-related overhead, signed residual runtime
-difference, and explicit faster/slower interpretation fields.
-`aggregate_results.csv` groups matching repetitions and reports their means and
-sample standard deviations. A group containing only one successful repetition
-has a standard deviation of `0`.
+The tests cover:
 
-### Checkpoint retention
+- PID/start-time-safe adaptive process cleanup;
+- TCP, UDP, filesystem Unix, and abstract Unix socket reuse;
+- protection against killing an unrelated process after PID/endpoint changes;
+- the version-specific DMTCP backlog and duplex-refill patch bundle, patch
+  checksums, bounded build jobs, and script contract;
+- bounded same-checkpoint restore retry after a controlled first-attempt stall;
+- final canonical-log refresh after delayed restored-application output;
+- pre-run cleanup, incomplete-run replacement, success-marker creation, and resume skipping;
+- marker-based result summarization and rejection of unmarked runs.
 
-Keep checkpoint files:
+## Emergency cleanup
 
-```bash
-CHECKPOINT_CLEANUP_MODE=keep-checkpoints ./scripts/run_all.sh
-```
-
-Delete them after their sizes are measured:
-
-```bash
-CHECKPOINT_CLEANUP_MODE=delete-checkpoints ./scripts/run_all.sh
-```
-
-### Existing run directories
-
-```bash
-EXISTING_RUN_POLICY=replace ./scripts/run_all.sh  # default
-EXISTING_RUN_POLICY=skip ./scripts/run_all.sh
-EXISTING_RUN_POLICY=error ./scripts/run_all.sh
-```
-
-### Emergency cleanup
+To remove abandoned DMTCP/MPI/NPB processes manually:
 
 ```bash
 ./scripts/kill_dmtcp_processes.sh
 ```
 
-This terminates matching DMTCP, Hydra, MPI, BT, and CG processes owned by the
-current user. Do not run it while another desired experiment is active.
+Do not run it while another experiment owned by the same user is intended to
+remain active.
