@@ -1,21 +1,23 @@
 diff -uNr a/src/plugin/ipc/socket/kernelbufferdrainer.cpp b/src/plugin/ipc/socket/kernelbufferdrainer.cpp
 --- a/src/plugin/ipc/socket/kernelbufferdrainer.cpp	2026-07-26 23:13:18.317052784 +0000
 +++ b/src/plugin/ipc/socket/kernelbufferdrainer.cpp	2026-07-26 23:13:18.317052784 +0000
-@@ -26,6 +26,8 @@
+@@ -26,6 +26,9 @@
  #include "connectionmessage.h"
  #include "socketwrappers.h"
  #include "util.h"
 +#include <errno.h>
 +#include <poll.h>
++#include <limits.h>
  #include <sys/ioctl.h>
  #include <sys/socket.h>
  
-@@ -290,59 +292,310 @@
+@@ -290,59 +293,417 @@
  {
    JTRACE("refilling socket buffers") (_drainedData.size());
  
 -  // write all buffers out (stream sockets only)
-+  // Refill stream sockets using a nonblocking duplex state machine.
++  // Refill stream sockets using a receive-capacity-aware nonblocking
++  // duplex state machine.
 +  //
 +  // The previous implementation wrote every complete saved buffer before it
 +  // started reading any peer buffer.  When both endpoints had large saved
@@ -25,6 +27,7 @@ diff -uNr a/src/plugin/ipc/socket/kernelbufferdrainer.cpp b/src/plugin/ipc/socke
 +  struct StreamRefillState
 +  {
 +    int fd;
++    int originalReceiveBufferSize;
 +
 +    ConnMsg outgoingMsg;
 +    size_t outgoingMsgOffset;
@@ -43,6 +46,7 @@ diff -uNr a/src/plugin/ipc/socket/kernelbufferdrainer.cpp b/src/plugin/ipc/socke
 +
 +    StreamRefillState(int socketFd, vector<char> *data)
 +      : fd(socketFd),
++        originalReceiveBufferSize(0),
 +        outgoingMsg(ConnMsg::REFILL),
 +        outgoingMsgOffset(0),
 +        outgoingData(data),
@@ -54,6 +58,95 @@ diff -uNr a/src/plugin/ipc/socket/kernelbufferdrainer.cpp b/src/plugin/ipc/socke
 +        incomingDataOffset(0),
 +        echoOffset(0)
 +    {
++      unsigned receiveBufferLength = sizeof(originalReceiveBufferSize);
++      JASSERT(getsockopt(socketFd,
++                         SOL_SOCKET,
++                         SO_RCVBUF,
++                         (void *)&originalReceiveBufferSize,
++                         &receiveBufferLength) == 0)
++        (socketFd) (JASSERT_ERRNO)
++        .Text("failed to read stream-refill receive buffer size");
++
++      // The peer must echo this socket's saved receive-queue data back into
++      // this socket before the application resumes.  The duplex state machine
++      // prevents write/write deadlock, but it still cannot finish if the
++      // reconstructed receive queue is smaller than the saved payload.
++      const size_t receiveBufferMargin = 64U * 1024U;
++      JASSERT(data->size() <=
++              static_cast<size_t>(INT_MAX) - receiveBufferMargin)
++        (socketFd) (data->size())
++        .Text("stream-refill receive payload exceeds supported size");
++
++      const int requiredReceiveBufferSize =
++        static_cast<int>(data->size() + receiveBufferMargin);
++      int activeReceiveBufferSize = originalReceiveBufferSize;
++
++      if (activeReceiveBufferSize < requiredReceiveBufferSize) {
++        int requestedReceiveBufferSize = requiredReceiveBufferSize;
++        int resizeResult = _real_setsockopt(socketFd,
++                                            SOL_SOCKET,
++                                            SO_RCVBUF,
++                                            (void *)&requestedReceiveBufferSize,
++                                            sizeof(requestedReceiveBufferSize));
++        if (resizeResult != 0 && errno != EPERM && errno != ENOBUFS) {
++          JASSERT(false)
++            (socketFd) (requestedReceiveBufferSize) (JASSERT_ERRNO)
++            .Text("failed to enlarge stream-refill receive buffer");
++        }
++
++        receiveBufferLength = sizeof(activeReceiveBufferSize);
++        JASSERT(getsockopt(socketFd,
++                           SOL_SOCKET,
++                           SO_RCVBUF,
++                           (void *)&activeReceiveBufferSize,
++                           &receiveBufferLength) == 0)
++          (socketFd) (JASSERT_ERRNO)
++          .Text("failed to verify enlarged stream-refill receive buffer");
++
++#ifdef SO_RCVBUFFORCE
++        if (activeReceiveBufferSize < requiredReceiveBufferSize) {
++          requestedReceiveBufferSize = requiredReceiveBufferSize;
++          resizeResult = _real_setsockopt(socketFd,
++                                          SOL_SOCKET,
++                                          SO_RCVBUFFORCE,
++                                          (void *)&requestedReceiveBufferSize,
++                                          sizeof(requestedReceiveBufferSize));
++          if (resizeResult != 0 && errno != EPERM && errno != ENOBUFS) {
++            JASSERT(false)
++              (socketFd) (requestedReceiveBufferSize) (JASSERT_ERRNO)
++              .Text("SO_RCVBUFFORCE failed during stream refill");
++          }
++
++          receiveBufferLength = sizeof(activeReceiveBufferSize);
++          JASSERT(getsockopt(socketFd,
++                             SOL_SOCKET,
++                             SO_RCVBUF,
++                             (void *)&activeReceiveBufferSize,
++                             &receiveBufferLength) == 0)
++            (socketFd) (JASSERT_ERRNO)
++            .Text("failed to verify forced stream-refill receive buffer");
++        }
++#endif
++      }
++
++      JASSERT(activeReceiveBufferSize >= requiredReceiveBufferSize)
++        (socketFd)
++        (data->size())
++        (originalReceiveBufferSize)
++        (activeReceiveBufferSize)
++        (requiredReceiveBufferSize)
++        .Text("stream-refill receive buffer is too small; root or "
++              "CAP_NET_ADMIN is required when net.core.rmem_max is lower "
++              "than the saved receive queue");
++
++      if (activeReceiveBufferSize > originalReceiveBufferSize) {
++        JTRACE("temporarily expanded stream-refill receive buffer")
++          (socketFd)
++          (originalReceiveBufferSize)
++          (activeReceiveBufferSize)
++          (data->size());
++      }
++
 +      JASSERT(data->size() <= 0x7fffffffUL)
 +        (socketFd) (data->size())
 +        .Text("refill buffer is too large for ConnMsg::extraBytes");
@@ -356,6 +449,21 @@ diff -uNr a/src/plugin/ipc/socket/kernelbufferdrainer.cpp b/src/plugin/ipc/socke
 +  // remains in each receive queue as the restored application data.
 +  for (size_t index = 0; index < streamStates.size(); ++index) {
 +    streamStates[index].outgoingData->clear();
++    int requestedReceiveBufferSize =
++      streamStates[index].originalReceiveBufferSize / 2;
++    if (requestedReceiveBufferSize < 1) {
++      requestedReceiveBufferSize = 1;
++    }
++    JASSERT(_real_setsockopt(streamStates[index].fd,
++                             SOL_SOCKET,
++                             SO_RCVBUF,
++                             (void *)&requestedReceiveBufferSize,
++                             sizeof(requestedReceiveBufferSize)) == 0)
++      (streamStates[index].fd)
++      (streamStates[index].originalReceiveBufferSize)
++      (JASSERT_ERRNO)
++      .Text("failed to restore stream-refill receive buffer size");
++
 +    scaleSendBuffers(streamStates[index].fd, 0.5);
    }
  

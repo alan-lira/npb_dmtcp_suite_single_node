@@ -1048,14 +1048,17 @@ PY
 cleanup_failed_restore_attempt() {
   local attempt_number="$1"
   local attempt_dir="$2"
+  local apply_retry_grace="${3:-true}"
   local retry_cleanup_dir="${attempt_dir}/retry_cleanup"
   local cleanup_state="${retry_cleanup_dir}/captured_state.json"
   local capture_status=1
   local adaptive_status=1
   local wrapper_status=0
+  local adaptive_cleanup_pid=""
+  local wrapper_state=""
 
   mkdir -p "${retry_cleanup_dir}"
-  phase cleanup "Cleaning failed restore attempt ${attempt_number}/${RESTORE_MAX_ATTEMPTS} before reusing the same checkpoint."
+  phase cleanup "Cleaning failed restore attempt ${attempt_number}/${RESTORE_MAX_ATTEMPTS} using only processes captured for that attempt."
 
   if [ -n "${RESTORED_PID}" ] && pid_is_active "${RESTORED_PID}"; then
     set +e
@@ -1068,56 +1071,80 @@ cleanup_failed_restore_attempt() {
     capture_status=$?
     set -e
   else
-    printf '%s\n' "Restart wrapper was no longer active at retry cleanup." \
+    printf '%s\n' "Restart wrapper was no longer active before exact retry capture." \
       > "${retry_cleanup_dir}/capture.log"
   fi
 
-  if [ -n "${PORT}" ]; then
-    dmtcp_command --coord-port "${PORT}" --kill >/dev/null 2>&1 || true
+  if [ "${capture_status}" -ne 0 ]; then
+    printf '%s\n' "exact_capture_failed_no_broad_sweep" \
+      > "${retry_cleanup_dir}/cleanup_mode.txt"
+    phase cleanup "Could not capture the failed restore tree exactly; refusing a broad process sweep."
+    return 1
   fi
 
-  if [ "${capture_status}" -eq 0 ]; then
-    set +e
-    python3 "${ADAPTIVE_CLEANUP_HELPER}" cleanup \
-      --state "${cleanup_state}" \
-      --metrics-dir "${retry_cleanup_dir}" \
-      --timeout "${PRE_RESTORE_CLEANUP_TIMEOUT_SECONDS}" \
-      --poll "${PRE_RESTORE_CLEANUP_POLL_SECONDS}" \
-      --force-kill-after "${PRE_RESTORE_FORCE_KILL_AFTER_SECONDS}" \
-      --force-kill-grace "${PRE_RESTORE_FORCE_KILL_GRACE_SECONDS}" \
-      --final-grace "0" \
-      --report-interval "${PRE_RESTORE_CLEANUP_REPORT_INTERVAL_SECONDS}" \
-      > "${retry_cleanup_dir}/adaptive_cleanup.log" 2>&1
-    adaptive_status=$?
-    set -e
-    cat "${retry_cleanup_dir}/adaptive_cleanup.log"
-  else
-    phase cleanup "Could not capture the failed restore process tree exactly; using emergency process cleanup and explicit retry grace."
+  phase cleanup "Starting exact adaptive cleanup for failed restore attempt ${attempt_number}."
+  set +e
+  python3 "${ADAPTIVE_CLEANUP_HELPER}" cleanup \
+    --state "${cleanup_state}" \
+    --metrics-dir "${retry_cleanup_dir}" \
+    --timeout "${PRE_RESTORE_CLEANUP_TIMEOUT_SECONDS}" \
+    --poll "${PRE_RESTORE_CLEANUP_POLL_SECONDS}" \
+    --force-kill-after "${PRE_RESTORE_FORCE_KILL_AFTER_SECONDS}" \
+    --force-kill-grace "${PRE_RESTORE_FORCE_KILL_GRACE_SECONDS}" \
+    --final-grace "0" \
+    --report-interval "${PRE_RESTORE_CLEANUP_REPORT_INTERVAL_SECONDS}" \
+    > "${retry_cleanup_dir}/adaptive_cleanup.log" 2>&1 &
+  adaptive_cleanup_pid=$!
+  phase cleanup "Adaptive cleanup helper PID: ${adaptive_cleanup_pid}."
+
+  # The restart wrapper is a direct child of this shell. Reap it while the
+  # adaptive helper runs so a captured zombie cannot keep the helper waiting.
+  while kill -0 "${adaptive_cleanup_pid}" 2>/dev/null; do
+    if [ -n "${RESTORED_PID}" ]; then
+      wrapper_state=""
+      if [ -r "/proc/${RESTORED_PID}/stat" ]; then
+        wrapper_state="$(awk '{print $3}' "/proc/${RESTORED_PID}/stat" 2>/dev/null || true)"
+      fi
+      if [ "${wrapper_state}" = "Z" ] || \
+         ! kill -0 "${RESTORED_PID}" 2>/dev/null; then
+        wait "${RESTORED_PID}" >/dev/null 2>&1
+        wrapper_status=$?
+        printf '%s\n' "${wrapper_status}" \
+          > "${retry_cleanup_dir}/restart_wrapper_exit_status.txt"
+        RESTORED_PID=""
+      fi
+    fi
+    sleep "${PRE_RESTORE_CLEANUP_POLL_SECONDS}"
+  done
+
+  wait "${adaptive_cleanup_pid}"
+  adaptive_status=$?
+  set -e
+  cat "${retry_cleanup_dir}/adaptive_cleanup.log"
+
+  if [ "${adaptive_status}" -ne 0 ]; then
+    printf '%s\n' "exact_adaptive_cleanup_failed" \
+      > "${retry_cleanup_dir}/cleanup_mode.txt"
+    return 1
   fi
 
   if [ -n "${RESTORED_PID}" ]; then
-    terminate_process_tree "${RESTORED_PID}" TERM
-    sleep 1
-    terminate_process_tree "${RESTORED_PID}" KILL
+    if pid_is_active "${RESTORED_PID}"; then
+      printf '%s\n' "captured wrapper remained active after adaptive cleanup" \
+        > "${retry_cleanup_dir}/wrapper_cleanup_error.txt"
+      return 1
+    fi
     set +e
-    wait "${RESTORED_PID}"
+    wait "${RESTORED_PID}" >/dev/null 2>&1
     wrapper_status=$?
     set -e
-    printf '%s\n' "${wrapper_status}" > "${retry_cleanup_dir}/restart_wrapper_exit_status.txt"
+    printf '%s\n' "${wrapper_status}" \
+      > "${retry_cleanup_dir}/restart_wrapper_exit_status.txt"
     RESTORED_PID=""
   fi
 
-  if ! "${SCRIPT_DIR}/kill_dmtcp_processes.sh" \
-      > "${retry_cleanup_dir}/emergency_process_cleanup.log" 2>&1; then
-    cat "${retry_cleanup_dir}/emergency_process_cleanup.log" >&2
-    return 1
-  fi
-
-  if [ "${capture_status}" -eq 0 ] && [ "${adaptive_status}" -ne 0 ]; then
-    return 1
-  fi
-
-  if python3 - "${RESTORE_RETRY_FINAL_GRACE_SECONDS}" <<'PY'
+  if [ "${apply_retry_grace}" = "true" ] && \
+     python3 - "${RESTORE_RETRY_FINAL_GRACE_SECONDS}" <<'PY'
 import sys
 raise SystemExit(0 if float(sys.argv[1]) > 0 else 1)
 PY
@@ -1126,12 +1153,8 @@ PY
     sleep "${RESTORE_RETRY_FINAL_GRACE_SECONDS}"
   fi
 
-  if [ "${capture_status}" -eq 0 ]; then
-    printf '%s\n' "adaptive_endpoint_cleanup_plus_emergency_sweep" \
-      > "${retry_cleanup_dir}/cleanup_mode.txt"
-  else
-    printf '%s\n' "fallback_process_cleanup" > "${retry_cleanup_dir}/cleanup_mode.txt"
-  fi
+  printf '%s\n' "exact_captured_tree_and_endpoint_cleanup" \
+    > "${retry_cleanup_dir}/cleanup_mode.txt"
   return 0
 }
 
@@ -1157,7 +1180,7 @@ PY
   echo "DMTCP commit: ${DMTCP_COMMIT:-unknown}"
   echo "DMTCP restore listener backlog: ${DMTCP_RESTORE_LISTEN_BACKLOG:-unknown}"
   echo "DMTCP restore listener paths patched: ${DMTCP_RESTORE_LISTENER_PATHS:-unknown}"
-  echo "DMTCP duplex stream refill patch: ${DMTCP_DUPLEX_REFILL_PATCH_ACTIVE:-unknown}"
+  echo "DMTCP receive-capacity duplex refill patch: ${DMTCP_DUPLEX_REFILL_PATCH_ACTIVE:-unknown}"
   echo "DMTCP IPC plugin: ${DMTCP_IPC_PLUGIN_PATH:-unknown}"
   echo "DMTCP IPC plugin SHA256: ${DMTCP_IPC_PLUGIN_SHA256:-unknown}"
   echo "Kernel net.core.somaxconn: $(cat /proc/sys/net/core/somaxconn)"
@@ -1462,7 +1485,12 @@ for (( RESTORE_ATTEMPT=1; RESTORE_ATTEMPT<=RESTORE_MAX_ATTEMPTS; RESTORE_ATTEMPT
 
   phase restore "Attempt ${RESTORE_ATTEMPT}/${RESTORE_MAX_ATTEMPTS} failed: ${ATTEMPT_FAILURE_MESSAGE}."
 
-  if ! cleanup_failed_restore_attempt "${RESTORE_ATTEMPT}" "${ATTEMPT_DIR}"; then
+  APPLY_RETRY_GRACE="true"
+  if [ "${RESTORE_ATTEMPT}" -ge "${RESTORE_MAX_ATTEMPTS}" ]; then
+    APPLY_RETRY_GRACE="false"
+  fi
+
+  if ! cleanup_failed_restore_attempt "${RESTORE_ATTEMPT}" "${ATTEMPT_DIR}" "${APPLY_RETRY_GRACE}"; then
     echo "0" > dmtcp_restore_marker_found.txt
     echo "FAILED" > run_status.txt
     fail "failed restore attempt ${RESTORE_ATTEMPT} could not be cleaned safely; no further attempt was launched."

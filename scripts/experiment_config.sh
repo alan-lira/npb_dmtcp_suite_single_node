@@ -59,7 +59,7 @@ NPB_CLASS="${NPB_CLASS:-D}"
 WORKING_DMTCP_COMMIT="${WORKING_DMTCP_COMMIT:-6896e12276a9fe449edb0cf206203ce01b19efe6}"
 WORKING_DMTCP_RESTORE_LISTEN_BACKLOG="${WORKING_DMTCP_RESTORE_LISTEN_BACKLOG:-1024}"
 WORKING_DMTCP_RESTORE_LISTENER_PATHS="${WORKING_DMTCP_RESTORE_LISTENER_PATHS:-4}"
-WORKING_DMTCP_KERNELBUFFERDRAINER_SHA256="${WORKING_DMTCP_KERNELBUFFERDRAINER_SHA256:-c5d7b960220762b6a291f5a1aef5989786ed47c00318dcc78a8fb2b6db9cf04c}"
+WORKING_DMTCP_DUPLEX_PATCH_SHA256="${WORKING_DMTCP_DUPLEX_PATCH_SHA256:-93a2edf137e6214410b436ecbed1ae0d6cf3056e2bb6325910d52e50e3df28a2}"
 WORKING_MPICH_VERSION="${WORKING_MPICH_VERSION:-5.0.0}"
 WORKING_MPICH_DEVICE="${WORKING_MPICH_DEVICE:-ch3:nemesis}"
 
@@ -287,28 +287,43 @@ verify_single_node_stack() {
     return 1
   fi
 
+  # Verify only release-stable assertion strings.  JTRACE messages may be
+  # compiled out of an optimized DMTCP build and must not be used as runtime
+  # proof that the patch is absent.
   if ! grep -aFq 'stream-refill header receive failed' "${dmtcp_ipc_plugin}" || \
-     ! grep -aFq 'stream-refill payload send failed' "${dmtcp_ipc_plugin}"; then
+     ! grep -aFq 'stream-refill payload send failed' "${dmtcp_ipc_plugin}" || \
+     ! grep -aFq 'stream-refill receive buffer is too small' "${dmtcp_ipc_plugin}" || \
+     ! grep -aFq 'failed to restore stream-refill receive buffer size' "${dmtcp_ipc_plugin}"; then
     echo "ERROR: The active DMTCP IPC plugin does not contain the" >&2
-    echo "nonblocking duplex stream-refill fix." >&2
+    echo "receive-capacity-aware duplex stream-refill fix." >&2
     echo "  Plugin: ${dmtcp_ipc_plugin}" >&2
     echo "Rebuild DMTCP with install_dmtcp_mpich_env.sh." >&2
     return 1
   fi
 
-  if [ -n "${DMTCP_DUPLEX_REFILL_PATCH:-}" ] && \
-     [ "${DMTCP_DUPLEX_REFILL_PATCH}" != "1" ]; then
-    echo "ERROR: The environment helper reports that the DMTCP duplex" >&2
-    echo "stream-refill patch is inactive." >&2
+  if [ "${DMTCP_DUPLEX_REFILL_PATCH:-}" != "1" ] || \
+     [ "${DMTCP_REFILL_RECEIVE_CAPACITY_PATCH:-}" != "1" ]; then
+    echo "ERROR: The environment helper reports that the DMTCP" >&2
+    echo "receive-capacity-aware duplex stream-refill patch is inactive." >&2
     return 1
   fi
 
-  if [ -n "${DMTCP_KERNELBUFFERDRAINER_SHA256:-}" ] && \
-     [ "${DMTCP_KERNELBUFFERDRAINER_SHA256}" != \
-       "${WORKING_DMTCP_KERNELBUFFERDRAINER_SHA256}" ]; then
-    echo "ERROR: Unexpected patched kernelbufferdrainer.cpp checksum." >&2
-    echo "  Required: ${WORKING_DMTCP_KERNELBUFFERDRAINER_SHA256}" >&2
-    echo "  Active:   ${DMTCP_KERNELBUFFERDRAINER_SHA256}" >&2
+  if [ "${DMTCP_DUPLEX_PATCH_FILE_SHA256:-}" != \
+       "${WORKING_DMTCP_DUPLEX_PATCH_SHA256}" ]; then
+    echo "ERROR: Unexpected DMTCP stream-refill patch checksum." >&2
+    echo "  Required: ${WORKING_DMTCP_DUPLEX_PATCH_SHA256}" >&2
+    echo "  Active:   ${DMTCP_DUPLEX_PATCH_FILE_SHA256:-unset}" >&2
+    return 1
+  fi
+
+  if ! grep -Fxq \
+      "dmtcp_duplex_patch_file_sha256=${WORKING_DMTCP_DUPLEX_PATCH_SHA256}" \
+      "${DMTCP_MPICH_MANIFEST:-/nonexistent}" 2>/dev/null || \
+     ! grep -Fxq \
+      "dmtcp_refill_receive_capacity_patch=1" \
+      "${DMTCP_MPICH_MANIFEST:-/nonexistent}" 2>/dev/null; then
+    echo "ERROR: The build manifest does not verify the active" >&2
+    echo "receive-capacity-aware stream-refill patch." >&2
     return 1
   fi
 
@@ -323,9 +338,11 @@ verify_single_node_stack() {
   fi
 
   DMTCP_DUPLEX_REFILL_PATCH_ACTIVE=1
+  DMTCP_REFILL_RECEIVE_CAPACITY_PATCH_ACTIVE=1
   DMTCP_IPC_PLUGIN_PATH="${dmtcp_ipc_plugin}"
   DMTCP_IPC_PLUGIN_SHA256="${dmtcp_ipc_plugin_sha256}"
   export DMTCP_DUPLEX_REFILL_PATCH_ACTIVE
+  export DMTCP_REFILL_RECEIVE_CAPACITY_PATCH_ACTIVE
   export DMTCP_IPC_PLUGIN_PATH
   export DMTCP_IPC_PLUGIN_SHA256
 

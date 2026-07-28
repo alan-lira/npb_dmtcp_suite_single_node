@@ -26,9 +26,13 @@ A standard unified diff for:
 src/plugin/ipc/socket/kernelbufferdrainer.cpp
 ```
 
-It replaces the blocking two-phase stream-buffer refill with the validated
-nonblocking duplex state machine. The installer requires the known original
+It replaces the blocking two-phase stream-buffer refill with a
+receive-capacity-aware nonblocking duplex state machine. Before refill, each
+stream verifies that its reconstructed receive buffer can hold the saved data
+that the peer must echo back. It first uses `SO_RCVBUF`, falls back to
+`SO_RCVBUFFORCE` when the normal kernel limit is insufficient, and restores the
+original buffer setting after refill. The installer requires the known original
 source checksum, applies the patch with `--forward` and zero fuzz, and verifies
-the final source checksum and implementation markers.
+the exact patch checksum and implementation markers.
 
 Neither patch is intended for another DMTCP revision.

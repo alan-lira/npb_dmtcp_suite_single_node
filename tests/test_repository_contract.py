@@ -52,7 +52,7 @@ def main() -> int:
         f"unexpected restore-backlog patch checksum: {backlog_patch_sha256}",
     )
     require(
-        duplex_patch_sha256 == "f2c7baf517f7f7076a12e5703e36ab089b918b6aff72b544ddf1a59c46db897d",
+        duplex_patch_sha256 == "93a2edf137e6214410b436ecbed1ae0d6cf3056e2bb6325910d52e50e3df28a2",
         f"unexpected duplex-refill patch checksum: {duplex_patch_sha256}",
     )
 
@@ -116,22 +116,43 @@ def main() -> int:
         'stream-refill payload send failed' in duplex_patch,
         "duplex-refill patch lacks its state-machine marker",
     )
+    require(
+        'stream-refill receive buffer is too small' in duplex_patch,
+        "duplex-refill patch lacks receive-capacity verification",
+    )
+    require('SO_RCVBUFFORCE' in duplex_patch, "duplex-refill patch lacks privileged receive-buffer fallback")
+    require(
+        'failed to restore stream-refill receive buffer size' in duplex_patch,
+        "duplex-refill patch does not restore the original receive-buffer setting",
+    )
     require('+#include <poll.h>' in duplex_patch, "duplex-refill patch lacks poll support")
     require(
         'replacements = (' not in installer,
         "old embedded backlog replacement table remains in installer",
     )
     require(
-        'WORKING_DMTCP_KERNELBUFFERDRAINER_SHA256=' in config,
-        "configuration duplex-refill checksum is missing",
+        'WORKING_DMTCP_DUPLEX_PATCH_SHA256=' in config,
+        "configuration duplex-refill patch checksum is missing",
     )
     require(
-        "DMTCP_DUPLEX_REFILL_PATCH_ACTIVE=1" in config,
-        "runtime duplex-refill plugin verification is missing",
+        "DMTCP_REFILL_RECEIVE_CAPACITY_PATCH_ACTIVE=1" in config,
+        "runtime receive-capacity plugin verification is missing",
     )
     require(
-        "nonblocking duplex state machine" in readme,
-        "README duplex-refill documentation missing",
+        "failed to restore stream-refill receive buffer size" in config,
+        "runtime verification lacks a release-stable receive-capacity marker",
+    )
+    require(
+        "temporarily expanded stream-refill receive buffer' \"${dmtcp_ipc_plugin}\"" not in config,
+        "runtime verification still depends on a JTRACE-only marker",
+    )
+    require(
+        "JTRACE text may be omitted by optimized builds" in installer,
+        "installer does not document release-stable plugin verification",
+    )
+    require(
+        "receive-capacity-aware nonblocking duplex state machine" in readme,
+        "README receive-capacity duplex-refill documentation missing",
     )
 
     require(
@@ -144,6 +165,18 @@ def main() -> int:
         "restore retry grace default is missing",
     )
     require("cleanup_failed_restore_attempt" in run_one, "failed-attempt cleanup is missing")
+    require(
+        'local apply_retry_grace="${3:-true}"' in run_one,
+        "failed-attempt cleanup cannot distinguish a real retry from final cleanup",
+    )
+    require(
+        'APPLY_RETRY_GRACE="false"' in run_one,
+        "final failed restore attempt still applies the retry-only grace",
+    )
+    require(
+        "skipped after the final failed attempt" in readme,
+        "README does not document final-attempt grace behavior",
+    )
     require("restore_attempts_summary.tsv" in run_one, "restore-attempt summary is missing")
     require("successful_restore_attempt_seconds.txt" in run_one, "successful-attempt metric is missing")
     require("restore_attempt_count" in summarizer, "summarizer does not expose restore-attempt counts")

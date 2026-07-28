@@ -48,7 +48,7 @@ if (
     "${RESTORE_IP_LOCAL_RESERVED_PORTS_PATH}" \
     "${WORKING_DMTCP_RESTORE_LISTEN_BACKLOG}" \
     "${WORKING_DMTCP_RESTORE_LISTENER_PATHS}" \
-    "${WORKING_DMTCP_KERNELBUFFERDRAINER_SHA256}"
+    "${WORKING_DMTCP_DUPLEX_PATCH_SHA256}"
 ); then
   printf '[OK] Runtime load: scripts/experiment_config.sh\n'
 else
@@ -178,7 +178,7 @@ BACKLOG_PATCH="${DMTCP_PATCH_DIR}/connectionrewirer-backlog-1024.exact.patch"
 DUPLEX_PATCH="${DMTCP_PATCH_DIR}/kernelbufferdrainer-duplex-refill.patch"
 OLD_DUPLEX_OVERRIDE="${DMTCP_PATCH_DIR}/kernelbufferdrainer.cpp"
 EXPECTED_BACKLOG_PATCH_SHA256="72bc6bc3d338a78c9e1ebe89692f12c544e92ad2862be58b8aca942702a981a1"
-EXPECTED_DUPLEX_PATCH_SHA256="f2c7baf517f7f7076a12e5703e36ab089b918b6aff72b544ddf1a59c46db897d"
+EXPECTED_DUPLEX_PATCH_SHA256="93a2edf137e6214410b436ecbed1ae0d6cf3056e2bb6325910d52e50e3df28a2"
 
 backlog_pairs_ok=1
 grep -Fxq 'FROM=jalib::JServerSocket restoreSocket(sockAddr, 0);' "${BACKLOG_PATCH}" 2>/dev/null \
@@ -208,7 +208,9 @@ if [ -f "${BACKLOG_PATCH}" ] && \
      "${SCRIPT_DIR}/install_dmtcp_mpich_env.sh" && \
    grep -Fq '+#include <poll.h>' "${DUPLEX_PATCH}" && \
    grep -Fq 'stream-refill payload send failed' "${DUPLEX_PATCH}" && \
-   grep -Fq 'DMTCP_DUPLEX_REFILL_PATCH_ACTIVE=1' \
+   grep -Fq 'stream-refill receive buffer is too small' "${DUPLEX_PATCH}" && \
+   grep -Fq 'SO_RCVBUFFORCE' "${DUPLEX_PATCH}" && \
+   grep -Fq 'DMTCP_REFILL_RECEIVE_CAPACITY_PATCH_ACTIVE=1' \
      "${SCRIPT_DIR}/experiment_config.sh"; then
   printf '[OK] Version-specific DMTCP patch bundle integration\n'
 else
@@ -268,6 +270,8 @@ fi
 for test_script in \
   test_summarize_results.py \
   test_repository_contract.py \
+  test_dmtcp_patch_application.py \
+  test_refill_receive_capacity.py \
   test_restore_port_reservation.py \
   test_adaptive_pre_restore_cleanup.py; do
   printf '[RUN] Test: tests/%s\n' "${test_script}"

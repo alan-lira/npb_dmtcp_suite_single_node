@@ -39,9 +39,8 @@ DMTCP_REF="${DMTCP_REF:-6896e12276a9fe449edb0cf206203ce01b19efe6}"
 WORKING_DMTCP_COMMIT="6896e12276a9fe449edb0cf206203ce01b19efe6"
 WORKING_DMTCP_RESTORE_LISTEN_BACKLOG="1024"
 WORKING_DMTCP_BACKLOG_PATCH_SHA256="72bc6bc3d338a78c9e1ebe89692f12c544e92ad2862be58b8aca942702a981a1"
-WORKING_DMTCP_DUPLEX_PATCH_SHA256="f2c7baf517f7f7076a12e5703e36ab089b918b6aff72b544ddf1a59c46db897d"
+WORKING_DMTCP_DUPLEX_PATCH_SHA256="93a2edf137e6214410b436ecbed1ae0d6cf3056e2bb6325910d52e50e3df28a2"
 WORKING_DMTCP_KERNELBUFFERDRAINER_ORIGINAL_SHA256="1913813176868a6226245963b90b5976c802bc70dc3a924d2405c2375b5bf94d"
-WORKING_DMTCP_KERNELBUFFERDRAINER_PATCHED_SHA256="c5d7b960220762b6a291f5a1aef5989786ed47c00318dcc78a8fb2b6db9cf04c"
 WORKING_MPICH_VER="5.0.0"
 WORKING_MPICH_SHA256="e9350e32224283e95311f22134f36c98e3cd1c665d17fae20a6cc92ed3cffe11"
 
@@ -217,6 +216,7 @@ fi
 
 DMTCP_RESTORE_BACKLOG_PATCH=0
 DMTCP_DUPLEX_REFILL_PATCH=0
+DMTCP_REFILL_RECEIVE_CAPACITY_PATCH=0
 DMTCP_BACKLOG_PATCH_FILE_SHA256="not-applied"
 DMTCP_DUPLEX_REFILL_PATCH_FILE_SHA256="not-applied"
 DMTCP_CONNECTION_REWIRER_SHA256="$(
@@ -377,13 +377,6 @@ PY
   DMTCP_KERNELBUFFERDRAINER_SHA256="$(
     sha256sum "${DMTCP_KERNELBUFFERDRAINER_SOURCE}" | awk '{print $1}'
   )"
-  if [ "${DMTCP_KERNELBUFFERDRAINER_SHA256}" != \
-       "${WORKING_DMTCP_KERNELBUFFERDRAINER_PATCHED_SHA256}" ]; then
-    echo "ERROR: DMTCP duplex stream-refill patch verification failed." >&2
-    echo "  Expected: ${WORKING_DMTCP_KERNELBUFFERDRAINER_PATCHED_SHA256}" >&2
-    echo "  Actual:   ${DMTCP_KERNELBUFFERDRAINER_SHA256}" >&2
-    exit 1
-  fi
   if ! grep -Fq '#include <poll.h>' "${DMTCP_KERNELBUFFERDRAINER_SOURCE}"; then
     echo "ERROR: poll support is missing from the patched source." >&2
     exit 1
@@ -393,14 +386,23 @@ PY
     echo "ERROR: duplex-refill state machine marker is missing." >&2
     exit 1
   fi
+  if ! grep -Fq 'stream-refill receive buffer is too small' \
+      "${DMTCP_KERNELBUFFERDRAINER_SOURCE}" || \
+     ! grep -Fq 'temporarily expanded stream-refill receive buffer' \
+      "${DMTCP_KERNELBUFFERDRAINER_SOURCE}"; then
+    echo "ERROR: receive-capacity stream-refill markers are missing." >&2
+    exit 1
+  fi
   DMTCP_DUPLEX_REFILL_PATCH=1
+  DMTCP_REFILL_RECEIVE_CAPACITY_PATCH=1
 else
   echo "WARNING: Skipping the version-specific DMTCP patch bundle" >&2
   echo "because DMTCP_REF does not resolve to the validated working commit." >&2
 fi
 
 echo "DMTCP restore-backlog patch:      ${DMTCP_RESTORE_BACKLOG_PATCH}"
-echo "DMTCP duplex stream-refill patch: ${DMTCP_DUPLEX_REFILL_PATCH}"
+echo "DMTCP capacity-aware duplex refill: ${DMTCP_DUPLEX_REFILL_PATCH}"
+echo "DMTCP receive-capacity patch:      ${DMTCP_REFILL_RECEIVE_CAPACITY_PATCH}"
 echo "connectionrewirer.cpp SHA256:      ${DMTCP_CONNECTION_REWIRER_SHA256}"
 echo "kernelbufferdrainer.cpp SHA256:    ${DMTCP_KERNELBUFFERDRAINER_SHA256}"
 
@@ -447,14 +449,20 @@ if [ ! -f "${DMTCP_IPC_PLUGIN}" ]; then
 fi
 
 if [ "${DMTCP_DUPLEX_REFILL_PATCH}" = "1" ]; then
-  if ! grep -aFq 'stream-refill header receive failed' "${DMTCP_IPC_PLUGIN}"; then
-    echo "ERROR: Installed IPC plugin lacks the duplex-refill header marker." >&2
-    exit 1
-  fi
-  if ! grep -aFq 'stream-refill payload send failed' "${DMTCP_IPC_PLUGIN}"; then
-    echo "ERROR: Installed IPC plugin lacks the duplex-refill payload marker." >&2
-    exit 1
-  fi
+  # JTRACE text may be omitted by optimized builds.  Use assertion strings
+  # that are part of the compiled failure paths as release-stable markers.
+  for required_marker in \
+    'stream-refill header receive failed' \
+    'stream-refill payload send failed' \
+    'stream-refill receive buffer is too small' \
+    'failed to restore stream-refill receive buffer size'
+  do
+    if ! grep -aFq "${required_marker}" "${DMTCP_IPC_PLUGIN}"; then
+      echo "ERROR: Installed IPC plugin lacks required refill marker:" >&2
+      echo "  ${required_marker}" >&2
+      exit 1
+    fi
+  done
 fi
 DMTCP_IPC_PLUGIN_SHA256="$(sha256sum "${DMTCP_IPC_PLUGIN}" | awk '{print $1}')"
 
@@ -633,7 +641,7 @@ DMTCP_MPICH_MANIFEST="${ROOT_PREFIX}/dmtcp_mpich_single_node_manifest.txt"
 
 {
   echo "profile=DMTCP_MPICH_SINGLE_NODE"
-  echo "profile_version=6"
+  echo "profile_version=7"
   echo "build_timestamp=$(date -Is)"
   echo "kernel=$(uname -srvo)"
   echo "gcc=$(gcc --version | head -n 1)"
@@ -650,6 +658,7 @@ DMTCP_MPICH_MANIFEST="${ROOT_PREFIX}/dmtcp_mpich_single_node_manifest.txt"
   echo "dmtcp_backlog_patch_file_sha256=${DMTCP_BACKLOG_PATCH_FILE_SHA256}"
   echo "dmtcp_connectionrewirer_sha256=${DMTCP_CONNECTION_REWIRER_SHA256}"
   echo "dmtcp_duplex_refill_patch=${DMTCP_DUPLEX_REFILL_PATCH}"
+  echo "dmtcp_refill_receive_capacity_patch=${DMTCP_REFILL_RECEIVE_CAPACITY_PATCH}"
   echo "dmtcp_duplex_patch_file_sha256=${DMTCP_DUPLEX_REFILL_PATCH_FILE_SHA256}"
   echo "dmtcp_kernelbufferdrainer_sha256=${DMTCP_KERNELBUFFERDRAINER_SHA256}"
   echo "dmtcp_ipc_plugin_sha256=${DMTCP_IPC_PLUGIN_SHA256}"
@@ -675,8 +684,9 @@ if [ "${DMTCP_FULL_COMMIT}" = "${WORKING_DMTCP_COMMIT}" ] && \
    [ "${WORKING_DMTCP_RESTORE_LISTEN_BACKLOG}" = "1024" ] && \
    [ "${DMTCP_RESTORE_BACKLOG_PATCH}" = "1" ] && \
    [ "${DMTCP_DUPLEX_REFILL_PATCH}" = "1" ] && \
-   [ "${DMTCP_KERNELBUFFERDRAINER_SHA256}" = \
-     "${WORKING_DMTCP_KERNELBUFFERDRAINER_PATCHED_SHA256}" ]; then
+   [ "${DMTCP_REFILL_RECEIVE_CAPACITY_PATCH}" = "1" ] && \
+   [ "${DMTCP_DUPLEX_REFILL_PATCH_FILE_SHA256}" = \
+     "${WORKING_DMTCP_DUPLEX_PATCH_SHA256}" ]; then
   DMTCP_SINGLE_NODE_PROFILE=1
 else
   DMTCP_SINGLE_NODE_PROFILE=0
@@ -696,6 +706,8 @@ export DMTCP_RESTORE_LISTEN_BACKLOG="${WORKING_DMTCP_RESTORE_LISTEN_BACKLOG}"
 export DMTCP_RESTORE_LISTENER_PATHS="4"
 export DMTCP_RESTORE_BACKLOG_PATCH="${DMTCP_RESTORE_BACKLOG_PATCH}"
 export DMTCP_DUPLEX_REFILL_PATCH="${DMTCP_DUPLEX_REFILL_PATCH}"
+export DMTCP_REFILL_RECEIVE_CAPACITY_PATCH="${DMTCP_REFILL_RECEIVE_CAPACITY_PATCH}"
+export DMTCP_DUPLEX_PATCH_FILE_SHA256="${DMTCP_DUPLEX_REFILL_PATCH_FILE_SHA256}"
 export DMTCP_KERNELBUFFERDRAINER_SHA256="${DMTCP_KERNELBUFFERDRAINER_SHA256}"
 export DMTCP_IPC_PLUGIN_SHA256="${DMTCP_IPC_PLUGIN_SHA256}"
 export DMTCP_MPICH_MANIFEST="${DMTCP_MPICH_MANIFEST}"
@@ -758,6 +770,7 @@ echo "AUTOCONF_HOME:      ${AUTOCONF_HOME}"
 echo "PROFILE:            ${DMTCP_SINGLE_NODE_PROFILE}"
 echo "RESTORE_BACKLOG:    ${DMTCP_RESTORE_LISTEN_BACKLOG}"
 echo "DUPLEX_REFILL:      ${DMTCP_DUPLEX_REFILL_PATCH}"
+echo "RECEIVE_CAPACITY:   ${DMTCP_REFILL_RECEIVE_CAPACITY_PATCH}"
 echo "KBD_SHA256:         ${DMTCP_KERNELBUFFERDRAINER_SHA256}"
 echo "IPC_PLUGIN_SHA256:  ${DMTCP_IPC_PLUGIN_SHA256}"
 echo "KERNEL_SOMAXCONN:   $(cat /proc/sys/net/core/somaxconn)"

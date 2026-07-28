@@ -8,9 +8,10 @@ The validated software profile is:
 - DMTCP commit `6896e12276a9fe449edb0cf206203ce01b19efe6`;
 - DMTCP restore-listener backlog patched from `32` to `1024` for the primary
   IPv4 `JServerSocket`, IPv6, Unix-stream, and Unix-seqpacket restore sockets;
-- DMTCP stream-buffer refill replaced with a nonblocking duplex state machine
-  to prevent symmetric refill deadlocks when both MPI peers restore large
-  buffered payloads;
+- DMTCP stream-buffer refill replaced with a receive-capacity-aware
+  nonblocking duplex state machine. It prevents symmetric write/write refill
+  deadlocks and temporarily enlarges reconstructed receive buffers when saved
+  application data exceeds the kernel default;
 - Linux `net.core.somaxconn` verified at `1024` or greater;
 - MPICH `5.0.0` using `ch3:nemesis`;
 - MPICH embedded hwloc built without libudev;
@@ -135,14 +136,15 @@ The installer:
 
 6. applies `kernelbufferdrainer-duplex-refill.patch` as a strict unified diff
    with `--forward`, zero fuzz, and no interactive patch decisions;
-7. verifies the patched source contents and the final
-   `kernelbufferdrainer.cpp` checksum;
+7. verifies the pinned original source checksum, the exact patch checksum,
+   and the receive-capacity implementation markers in the patched source;
 8. verifies or raises `net.core.somaxconn` to at least `1024`;
-9. builds DMTCP and verifies that the installed `libdmtcp_ipc.so` contains the
-   duplex-refill implementation markers;
+9. builds DMTCP and verifies that the installed `libdmtcp_ipc.so` contains
+   both the duplex state-machine and receive-capacity implementation markers;
 10. builds MPICH `5.0.0` with `ch3:nemesis` and embedded hwloc without libudev;
 11. writes a reproducibility manifest and environment helper, including the
-    patch-file and patched-source checksums.
+    exact patch-file checksum, resulting source checksum, and installed plugin
+    checksum.
 
 ### Version-specific DMTCP patch bundle
 
@@ -159,20 +161,43 @@ its four `TO` values must not already exist; otherwise installation stops
 without modifying the source. This avoids silently applying the backlog change
 to an unexpected DMTCP source layout.
 
-`kernelbufferdrainer-duplex-refill.patch` is a standard unified diff. The
-installer first verifies the pinned original source checksum, applies the diff
-with zero fuzz, and then verifies the complete patched-source checksum and
-state-machine markers.
+`kernelbufferdrainer-duplex-refill.patch` is a standard unified diff. The installer first verifies the pinned original source checksum, applies the
+diff with zero fuzz, and then verifies the resulting source and implementation
+markers. During restart, the patch uses `SO_RCVBUF` and, when the normal kernel
+limit is insufficient, `SO_RCVBUFFORCE`. The original receive-buffer setting is
+restored after the refill completes.
 
-The patch directory name, asset checksums, source checksums, and strict
-application checks prevent either modification from being reused silently with
-a different DMTCP revision.
+The patch directory name, exact asset checksums, pinned original-source
+checksum, and strict application checks prevent either modification from being
+reused silently with a different DMTCP revision.
 
 The environment helper is written to:
 
 ```text
 ~/opt/enable_dmtcp_mpich_env.sh
 ```
+
+### Receive-buffer refill capacity fix
+
+The failure bundle from the 36-rank BT.D run showed five reconstructed TCP
+streams with receive queues fixed at `127104` bytes while approximately
+`430000` bytes remained queued on each peer. The earlier port reservation
+removed `EADDRINUSE`, but the refill could not finish because DMTCP had no room
+to echo the saved application data back into those receive queues.
+
+The implementation is a receive-capacity-aware nonblocking duplex state machine.
+
+Runtime verification uses release-stable assertion strings embedded in
+`libdmtcp_ipc.so`. It deliberately does not require `JTRACE` text, because
+optimized DMTCP builds may compile trace-only messages out even when the
+patched implementation is present. The environment helper and manifest
+checksums remain part of the verification contract.
+
+The updated patch sizes every reconstructed stream receive buffer from the
+amount of data originally drained from that socket, adds a safety margin, and
+verifies the effective kernel buffer size before any refill traffic begins. A
+clear assertion is produced if the host lacks sufficient privilege to use
+`SO_RCVBUFFORCE` when `net.core.rmem_max` is too small.
 
 ### Build parallelism
 
@@ -404,8 +429,8 @@ After a failed attempt, the runner:
 2. captures the failed restored process tree and its endpoints;
 3. stops the failed restore and adaptively waits for those endpoints to become
    reusable;
-4. runs the emergency process cleanup as a final verification;
-5. applies `RESTORE_RETRY_FINAL_GRACE_SECONDS` only after adaptive endpoint cleanup and the final process sweep;
+4. refuses a broad process sweep if exact PID/start-time capture is unavailable;
+5. applies `RESTORE_RETRY_FINAL_GRACE_SECONDS` only when another retry will actually be launched;
 6. launches the unchanged generated restart script again from the same
    checkpoint images.
 
@@ -493,7 +518,7 @@ The suite is intended for one experiment at a time on a single node.
 | `CHECKPOINT_CLEANUP_MODE` | `delete-checkpoints` | Retain or delete checkpoint files |
 | `DMTCP_RESTORE_TIMEOUT_SECONDS` | `600` | Timeout applied independently to each restore attempt |
 | `RESTORE_MAX_ATTEMPTS` | `3` | Maximum attempts from the same checkpoint |
-| `RESTORE_RETRY_FINAL_GRACE_SECONDS` | `10` | Verified-clear grace before a retry |
+| `RESTORE_RETRY_FINAL_GRACE_SECONDS` | `10` | Verified-clear grace before an actual retry; skipped after the final failed attempt |
 | `RESTORE_RESERVE_ORIGINAL_TCP_PORTS` | `true` | Reserve captured IPv4 TCP listeners during restore |
 | `RESTORE_PORT_RESERVATION_LOCK_FILE` | `/run/lock/npb_dmtcp_restore_ports.lock` | Serialize temporary reserved-port changes |
 | `RESTORE_PORT_RESERVATION_LOCK_TIMEOUT_SECONDS` | `30` | Maximum lock-acquisition wait |
