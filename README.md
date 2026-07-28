@@ -45,19 +45,22 @@ Checkpoint/restart experiments then use this sequence:
    to become reusable.
 9. Apply the configured final grace interval only after all endpoints are
    verified clear.
-10. Under a suite-wide lock, add the captured original IPv4 TCP listener ports
-    to `net.ipv4.ip_local_reserved_ports` so DMTCP's temporary
+10. Under a suite-wide lock, transactionally raise `net.core.rmem_max` and
+    `net.ipv4.tcp_rmem` to validated restore-time floors so reconstructed TCP
+    connections negotiate enough receive-window capacity before refill.
+11. Under a separate suite-wide lock, add the captured original IPv4 TCP
+    listener ports to `net.ipv4.ip_local_reserved_ports` so DMTCP's temporary
     `bind(port=0)` restore listener cannot consume one of them.
-11. Execute the generated DMTCP restart script without extra coordinator
+12. Execute the generated DMTCP restart script without extra coordinator
     arguments.
-12. Wait until every expected DMTCP client reports `WorkerState::RUNNING`.
-13. If the restore stalls, reports persistent bind errors, or exits before all
+13. Wait until every expected DMTCP client reports `WorkerState::RUNNING`.
+14. If the restore stalls, reports persistent bind errors, or exits before all
     clients are running, preserve per-attempt diagnostics, clean the failed
     restored process tree and endpoints, and retry the same checkpoint while
-    keeping the captured ports reserved.
-14. After a successful socket restart, restore the previous reserved-port
-    setting and release the lock.
-15. Continue the restored application, require `Verification = SUCCESSFUL`,
+    keeping both restore-scoped kernel transactions active.
+15. After a successful socket restart, restore the previous reserved-port and
+    TCP receive-window values exactly, then release both locks.
+16. Continue the restored application, require `Verification = SUCCESSFUL`,
     and create `SUCCESS.marker` atomically.
 
 The runner does not use `--ckpt-open-files` and does not reuse the original
@@ -74,6 +77,7 @@ patches/
 scripts/
   adaptive_pre_restore_cleanup.py
   restore_port_reservation.py
+  restore_tcp_receive_window.py
   build_npb_bt_cg_d.sh
   check_repository.sh
   experiment_config.sh
@@ -89,6 +93,7 @@ tests/
   test_adaptive_pre_restore_cleanup.py
   test_repository_contract.py
   test_restore_port_reservation.py
+  test_restore_tcp_receive_window.py
   test_restore_retry.py
   test_run_resume.py
   test_summarize_results.py
@@ -179,13 +184,13 @@ The environment helper is written to:
 
 ### Receive-buffer refill capacity fix
 
-The failure bundle from the 36-rank BT.D run showed five reconstructed TCP
-streams with receive queues fixed at `127104` bytes while approximately
-`430000` bytes remained queued on each peer. The earlier port reservation
-removed `EADDRINUSE`, but the refill could not finish because DMTCP had no room
-to echo the saved application data back into those receive queues.
+Checkpoint images can contain substantial buffered TCP data on both endpoints of
+a reconstructed stream. A refill procedure that performs blocking writes before
+draining peer data can deadlock when the available receive capacity is smaller
+than the saved payload.
 
-The implementation is a receive-capacity-aware nonblocking duplex state machine.
+The implementation therefore uses a receive-capacity-aware nonblocking duplex
+state machine.
 
 Runtime verification uses release-stable assertion strings embedded in
 `libdmtcp_ipc.so`. It deliberately does not require `JTRACE` text, because
@@ -385,12 +390,11 @@ baseline marker and timing file already exist.
 
 ## Restore-port collision protection
 
-The original failure included a case where DMTCP's temporary protected IPv4
-restore listener (`fd=823`) selected an original application listener port via
-`bind(port=0)`. The restored application later tried to recreate that same
-port and received `EADDRINUSE`.
+DMTCP creates a temporary protected IPv4 restore listener using `bind(port=0)`.
+Without explicit protection, automatic ephemeral allocation could select a port
+that a restored application listener must later recreate.
 
-For checkpoint/restart runs, `run_one.sh` now extracts the captured original
+For checkpoint/restart runs, `run_one.sh` extracts the captured original
 IPv4 TCP `LISTEN` ports and temporarily merges them into:
 
 ```text
@@ -411,12 +415,48 @@ sysctl (the experiments are normally run as `root`). Disabling it with
 `RESTORE_RESERVE_ORIGINAL_TCP_PORTS=false` is intended only for controlled
 comparison tests.
 
+## Restore-scoped TCP receive-window tuning
+
+Some checkpoint states require DMTCP to return more buffered TCP data than the
+host's default receive window can accommodate. Because TCP window scaling and
+receive capacity are established during connection creation, the required
+restore-time floors must be active before reconstructed sockets reconnect.
+
+For checkpoint/restart runs, `run_one.sh` applies this adjustment automatically
+immediately before the generated restart script is launched:
+
+```text
+net.core.rmem_max floor: 16777216
+net.ipv4.tcp_rmem floor: 4096 4194304 16777216
+```
+
+These are floors rather than unconditional replacements: a host already
+configured with larger values is never lowered during restore. The runner:
+
+1. acquires `RESTORE_TCP_RECEIVE_WINDOW_LOCK_FILE`;
+2. captures the exact current values;
+3. raises `net.core.rmem_max` before `net.ipv4.tcp_rmem`;
+4. verifies the values read back from the kernel;
+5. keeps them active through all restore attempts and retry cleanup;
+6. restores `net.ipv4.tcp_rmem` and then `net.core.rmem_max` to their exact
+   pre-restore values when clients reach `RUNNING`, on failure, or on
+   `EXIT`, `INT`, or `TERM` cleanup;
+7. verifies restoration before releasing the lock.
+
+The tuning is restore-scoped, so baseline execution and the pre-checkpoint
+portion of a checkpoint/restart run retain the host's normal TCP settings. Its
+small setup and release cost is included in `dmtcp_restore_seconds.txt`.
+
+This protection is enabled by default and requires permission to write both
+sysctls. `RESTORE_TUNE_TCP_RECEIVE_WINDOW=false` is intended only for controlled
+comparison or diagnostic testing.
+
 ## Automatic restore retries
 
-The patched DMTCP IPC plugin removes the deterministic symmetric stream-buffer
-refill deadlock observed with CG.D. Independent transient restart failures still
-do not immediately fail the experiment: by default, the runner performs up to
-three restore attempts using the same set of checkpoint images:
+The patched DMTCP IPC plugin prevents deterministic symmetric stream-buffer
+refill deadlocks. Independent transient restart failures still do not immediately
+fail the experiment: by default, the runner performs up to three restore attempts
+using the same set of checkpoint images:
 
 ```text
 RESTORE_MAX_ATTEMPTS=3
@@ -523,6 +563,13 @@ The suite is intended for one experiment at a time on a single node.
 | `RESTORE_PORT_RESERVATION_LOCK_FILE` | `/run/lock/npb_dmtcp_restore_ports.lock` | Serialize temporary reserved-port changes |
 | `RESTORE_PORT_RESERVATION_LOCK_TIMEOUT_SECONDS` | `30` | Maximum lock-acquisition wait |
 | `RESTORE_IP_LOCAL_RESERVED_PORTS_PATH` | `/proc/sys/net/ipv4/ip_local_reserved_ports` | Reserved-port sysctl path |
+| `RESTORE_TUNE_TCP_RECEIVE_WINDOW` | `true` | Apply restore-scoped receive-window floors |
+| `RESTORE_TCP_RECEIVE_WINDOW_LOCK_FILE` | `/run/lock/npb_dmtcp_restore_tcp_receive_window.lock` | Serialize temporary TCP receive-window changes |
+| `RESTORE_TCP_RECEIVE_WINDOW_LOCK_TIMEOUT_SECONDS` | `30` | Maximum receive-window lock wait |
+| `RESTORE_NET_CORE_RMEM_MAX` | `16777216` | Restore-time `net.core.rmem_max` floor |
+| `RESTORE_NET_IPV4_TCP_RMEM` | `4096 4194304 16777216` | Restore-time `net.ipv4.tcp_rmem` floors |
+| `RESTORE_NET_CORE_RMEM_MAX_PATH` | `/proc/sys/net/core/rmem_max` | Testable `rmem_max` sysctl path |
+| `RESTORE_NET_IPV4_TCP_RMEM_PATH` | `/proc/sys/net/ipv4/tcp_rmem` | Testable `tcp_rmem` sysctl path |
 | `CHECKPOINT_FILE_TIMEOUT_SECONDS` | `600` | Checkpoint-image timeout |
 | `DMTCP_EXPERIMENT_SIGNAL` | `30` | DMTCP checkpoint signal |
 | `DMTCP_PORT_MIN` | `20000` | Random coordinator-port lower bound |
@@ -577,6 +624,16 @@ restore_port_reservation_state.json
 restore_port_reservation_prepare.log
 restore_port_reservation_release.log
 restore_port_reservation_status.txt
+restore_tcp_receive_window_state.json
+restore_tcp_receive_window_prepare.log
+restore_tcp_receive_window_release.log
+restore_tcp_receive_window_status.txt
+restore_tcp_receive_window_original_rmem_max.txt
+restore_tcp_receive_window_original_tcp_rmem.txt
+restore_tcp_receive_window_applied_rmem_max.txt
+restore_tcp_receive_window_applied_tcp_rmem.txt
+restore_tcp_receive_window_released_rmem_max.txt
+restore_tcp_receive_window_released_tcp_rmem.txt
 dmtcp_restore_seconds.txt
 successful_restore_attempt_seconds.txt
 restore_attempt_count.txt
@@ -609,10 +666,12 @@ including captured-process shutdown, endpoint verification, and the final
 verified-clear grace interval.
 
 `dmtcp_restore_seconds.txt` measures the complete restore phase from
-preparing the captured-port reservation until the previous reserved-port value
-is restored after one attempt reaches all expected DMTCP clients in
-`WorkerState::RUNNING`. It includes reservation setup/release, failed-attempt
-duration, retry cleanup, and the configured verified-clear retry grace.
+preparing the restore-scoped TCP receive-window transaction through restoring
+both the previous reserved-port value and the exact previous TCP receive-window
+sysctls after one attempt reaches all expected DMTCP clients in
+`WorkerState::RUNNING`. It includes both transaction setup/release operations,
+failed-attempt duration, retry cleanup, and the configured verified-clear retry
+grace.
 
 `successful_restore_attempt_seconds.txt` measures only the attempt that
 successfully reached all expected clients in `WorkerState::RUNNING`.

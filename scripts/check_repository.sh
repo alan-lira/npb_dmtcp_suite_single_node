@@ -46,6 +46,13 @@ if (
     "${RESTORE_PORT_RESERVATION_LOCK_FILE}" \
     "${RESTORE_PORT_RESERVATION_LOCK_TIMEOUT_SECONDS}" \
     "${RESTORE_IP_LOCAL_RESERVED_PORTS_PATH}" \
+    "${RESTORE_TUNE_TCP_RECEIVE_WINDOW}" \
+    "${RESTORE_TCP_RECEIVE_WINDOW_LOCK_FILE}" \
+    "${RESTORE_TCP_RECEIVE_WINDOW_LOCK_TIMEOUT_SECONDS}" \
+    "${RESTORE_NET_CORE_RMEM_MAX}" \
+    "${RESTORE_NET_IPV4_TCP_RMEM}" \
+    "${RESTORE_NET_CORE_RMEM_MAX_PATH}" \
+    "${RESTORE_NET_IPV4_TCP_RMEM_PATH}" \
     "${WORKING_DMTCP_RESTORE_LISTEN_BACKLOG}" \
     "${WORKING_DMTCP_RESTORE_LISTENER_PATHS}" \
     "${WORKING_DMTCP_DUPLEX_PATCH_SHA256}"
@@ -130,6 +137,13 @@ required_settings=(
   RESTORE_PORT_RESERVATION_LOCK_FILE
   RESTORE_PORT_RESERVATION_LOCK_TIMEOUT_SECONDS
   RESTORE_IP_LOCAL_RESERVED_PORTS_PATH
+  RESTORE_TUNE_TCP_RECEIVE_WINDOW
+  RESTORE_TCP_RECEIVE_WINDOW_LOCK_FILE
+  RESTORE_TCP_RECEIVE_WINDOW_LOCK_TIMEOUT_SECONDS
+  RESTORE_NET_CORE_RMEM_MAX
+  RESTORE_NET_IPV4_TCP_RMEM
+  RESTORE_NET_CORE_RMEM_MAX_PATH
+  RESTORE_NET_IPV4_TCP_RMEM_PATH
 )
 for setting in "${required_settings[@]}"; do
   missing=0
@@ -229,6 +243,20 @@ else
   report_error 'transactional restore-port reservation integration is incomplete'
 fi
 
+
+if [ -x "${SCRIPT_DIR}/restore_tcp_receive_window.py" ] && \
+   grep -Fq 'apply_restore_tcp_receive_window' "${SCRIPT_DIR}/run_one.sh" && \
+   grep -Fq 'release_restore_tcp_receive_window' "${SCRIPT_DIR}/run_one.sh" && \
+   grep -Fq 'net.core.rmem_max' "${SCRIPT_DIR}/restore_tcp_receive_window.py" && \
+   grep -Fq 'net.ipv4.tcp_rmem' "${SCRIPT_DIR}/restore_tcp_receive_window.py" && \
+   grep -Fq 'flock -w "${RESTORE_TCP_RECEIVE_WINDOW_LOCK_TIMEOUT_SECONDS}"' \
+     "${SCRIPT_DIR}/run_one.sh" && \
+   grep -Fq 'Restore-scoped TCP receive-window tuning' "${REPO_ROOT}/README.md"; then
+  printf '[OK] Transactional restore TCP receive-window integration\n'
+else
+  report_error 'transactional restore TCP receive-window integration is incomplete'
+fi
+
 if grep -Fq 'copy_restore_attempt_to_canonical_logs "${SUCCESSFUL_ATTEMPT_DIR}"' \
     "${SCRIPT_DIR}/run_one.sh"; then
   printf '[OK] Final successful-attempt log refresh integration\n'
@@ -273,6 +301,7 @@ for test_script in \
   test_dmtcp_patch_application.py \
   test_refill_receive_capacity.py \
   test_restore_port_reservation.py \
+  test_restore_tcp_receive_window.py \
   test_adaptive_pre_restore_cleanup.py; do
   printf '[RUN] Test: tests/%s\n' "${test_script}"
   test_log="$(mktemp)"

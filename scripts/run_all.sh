@@ -86,6 +86,14 @@ case "${RESTORE_RESERVE_ORIGINAL_TCP_PORTS}" in
     ;;
 esac
 
+case "${RESTORE_TUNE_TCP_RECEIVE_WINDOW}" in
+  true|false)
+    ;;
+  *)
+    fail "RESTORE_TUNE_TCP_RECEIVE_WINDOW must be true or false."
+    ;;
+esac
+
 if [ "${COORDINATOR_LIFECYCLE}" != "fresh" ]; then
   fail "this package intentionally uses the successful fresh-coordinator workflow."
 fi
@@ -95,7 +103,8 @@ for positive_setting in \
   PRE_RESTORE_CLEANUP_POLL_SECONDS \
   PRE_RESTORE_CLEANUP_REPORT_INTERVAL_SECONDS \
   RESTORE_BIND_FAILURE_ABORT_SECONDS \
-  RESTORE_PORT_RESERVATION_LOCK_TIMEOUT_SECONDS; do
+  RESTORE_PORT_RESERVATION_LOCK_TIMEOUT_SECONDS \
+  RESTORE_TCP_RECEIVE_WINDOW_LOCK_TIMEOUT_SECONDS; do
   is_positive_number "${!positive_setting}" \
     || fail "${positive_setting} must be a positive number; received '${!positive_setting}'."
 done
@@ -123,6 +132,22 @@ fi
 
 [[ "${RESTORE_MAX_ATTEMPTS}" =~ ^[1-9][0-9]*$ ]] \
   || fail "RESTORE_MAX_ATTEMPTS must be a positive integer; received '${RESTORE_MAX_ATTEMPTS}'."
+
+[[ "${RESTORE_NET_CORE_RMEM_MAX}" =~ ^[1-9][0-9]*$ ]] \
+  || fail "RESTORE_NET_CORE_RMEM_MAX must be a positive integer; received '${RESTORE_NET_CORE_RMEM_MAX}'."
+
+python3 - "${RESTORE_NET_IPV4_TCP_RMEM}" <<'PY_VALIDATE_TCP_RMEM' \
+  || fail "RESTORE_NET_IPV4_TCP_RMEM must contain three positive integers satisfying minimum <= default <= maximum."
+import sys
+fields = sys.argv[1].split()
+if len(fields) != 3:
+    raise SystemExit(1)
+try:
+    values = [int(field) for field in fields]
+except ValueError:
+    raise SystemExit(1)
+raise SystemExit(0 if all(value > 0 for value in values) and values[0] <= values[1] <= values[2] else 1)
+PY_VALIDATE_TCP_RMEM
 
 mkdir -p "${RESULTS_ROOT}"
 RESULTS_ROOT="$(cd -- "${RESULTS_ROOT}" && pwd)"
@@ -221,6 +246,7 @@ echo "Bind-failure abort:      ${RESTORE_BIND_FAILURE_ABORT_SECONDS}s persistent
 echo "Restore attempts:        ${RESTORE_MAX_ATTEMPTS} maximum from the same checkpoint"
 echo "Retry verified grace:    ${RESTORE_RETRY_FINAL_GRACE_SECONDS}s"
 echo "Reserve restore ports:   ${RESTORE_RESERVE_ORIGINAL_TCP_PORTS} (lock timeout ${RESTORE_PORT_RESERVATION_LOCK_TIMEOUT_SECONDS}s)"
+echo "Restore TCP receive:     ${RESTORE_TUNE_TCP_RECEIVE_WINDOW} (rmem_max>=${RESTORE_NET_CORE_RMEM_MAX}; tcp_rmem>=${RESTORE_NET_IPV4_TCP_RMEM}; lock timeout ${RESTORE_TCP_RECEIVE_WINDOW_LOCK_TIMEOUT_SECONDS}s)"
 echo "DMTCP commit:           ${DMTCP_COMMIT}"
 echo "DMTCP restore backlog:  ${DMTCP_RESTORE_LISTEN_BACKLOG} across ${DMTCP_RESTORE_LISTENER_PATHS} listener paths (kernel somaxconn $(cat /proc/sys/net/core/somaxconn))"
 echo "MPICH:                  ${MPICH_VERSION} (${MPICH_DEVICE}, libudev ${MPICH_HWLOC_LIBUDEV})"

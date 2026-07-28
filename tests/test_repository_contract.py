@@ -29,6 +29,7 @@ def main() -> int:
     summarizer = (SCRIPTS / "summarize_results.py").read_text()
     cleanup = (SCRIPTS / "adaptive_pre_restore_cleanup.py").read_text()
     reservation = (SCRIPTS / "restore_port_reservation.py").read_text()
+    receive_window = (SCRIPTS / "restore_tcp_receive_window.py").read_text()
     readme = (REPO_ROOT / "README.md").read_text()
     patch_dir = (
         REPO_ROOT
@@ -200,6 +201,52 @@ def main() -> int:
         "README restore-port protection documentation missing",
     )
 
+    require(
+        'RESTORE_TUNE_TCP_RECEIVE_WINDOW="${RESTORE_TUNE_TCP_RECEIVE_WINDOW:-true}"'
+        in config,
+        "restore TCP receive-window tuning default is missing",
+    )
+    require(
+        'RESTORE_NET_CORE_RMEM_MAX="${RESTORE_NET_CORE_RMEM_MAX:-16777216}"'
+        in config,
+        "restore rmem_max floor is missing",
+    )
+    require(
+        'RESTORE_NET_IPV4_TCP_RMEM="${RESTORE_NET_IPV4_TCP_RMEM:-4096 4194304 16777216}"'
+        in config,
+        "restore tcp_rmem floor is missing",
+    )
+    require(
+        "apply_restore_tcp_receive_window" in run_one,
+        "restore TCP receive-window setup is missing",
+    )
+    require(
+        "release_restore_tcp_receive_window" in run_one,
+        "restore TCP receive-window release is missing",
+    )
+    restore_phase = run_one.index('RESTORE_START_NS="$(now_ns)"')
+    require(
+        run_one.index("apply_restore_tcp_receive_window", restore_phase)
+        < run_one.index("reserve_restore_ports", restore_phase),
+        "TCP receive-window tuning is not applied before restore port reservation",
+    )
+    require(
+        "net.core.rmem_max" in receive_window and "net.ipv4.tcp_rmem" in receive_window,
+        "receive-window helper does not manage both required sysctls",
+    )
+    require(
+        "Never lower host settings" in receive_window,
+        "receive-window helper does not preserve higher host settings",
+    )
+    require(
+        "restore_original_values" in receive_window,
+        "receive-window helper lacks transactional rollback/restoration",
+    )
+    require(
+        "Restore-scoped TCP receive-window tuning" in readme,
+        "README receive-window transaction documentation missing",
+    )
+
     final_wait = run_one.index('wait "${RESTORED_PID}"', run_one.index("monitor_background_process"))
     final_refresh = run_one.index(
         'copy_restore_attempt_to_canonical_logs "${SUCCESSFUL_ATTEMPT_DIR}"',
@@ -232,7 +279,9 @@ def main() -> int:
         "socket_cleanup_sleep_seconds.txt",
         "total_wall_seconds.txt",
     )
-    production_text = "\n".join((run_one, summarizer, cleanup, reservation, readme))
+    production_text = "\n".join(
+        (run_one, summarizer, cleanup, reservation, receive_window, readme)
+    )
     for artifact in forbidden_artifacts:
         require(artifact not in production_text, f"obsolete artifact remains: {artifact}")
 
@@ -245,7 +294,7 @@ def main() -> int:
     require("replace|skip|error" not in run_one + run_all, "old skip policy remains")
     require(not (REPO_ROOT / ".idea").exists(), ".idea directory is present")
 
-    print("[OK] repository contract: versioned DMTCP patches, final logs, bounded builds, cleanup, retries, markers, resume, and current artifacts")
+    print("[OK] repository contract: DMTCP patches, transactional restore sysctls, final logs, cleanup, retries, markers, resume, and current artifacts")
     return 0
 
 

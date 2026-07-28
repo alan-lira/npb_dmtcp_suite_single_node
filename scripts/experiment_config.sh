@@ -130,7 +130,10 @@ CHECKPOINT_CLEANUP_MODE="${CHECKPOINT_CLEANUP_MODE:-delete-checkpoints}"
 #   4. Capture the exact original process tree and its socket endpoints.
 #   5. Kill the original DMTCP computation and allow its coordinator to exit.
 #   6. Adaptively wait for the captured processes and endpoints to become clear.
-#   7. Execute the generated restart script without extra arguments.
+#   7. Transactionally raise restore-time TCP receive-window floors.
+#   8. Reserve captured original TCP listener ports against ephemeral reuse.
+#   9. Execute the generated restart script without extra arguments.
+#  10. Restore the exact previous kernel values after clients reach RUNNING.
 #
 # This value is intentionally fixed for the validated single-node workflow.
 COORDINATOR_LIFECYCLE="fresh"
@@ -179,6 +182,19 @@ RESTORE_RESERVE_ORIGINAL_TCP_PORTS="${RESTORE_RESERVE_ORIGINAL_TCP_PORTS:-true}"
 RESTORE_PORT_RESERVATION_LOCK_FILE="${RESTORE_PORT_RESERVATION_LOCK_FILE:-/run/lock/npb_dmtcp_restore_ports.lock}"
 RESTORE_PORT_RESERVATION_LOCK_TIMEOUT_SECONDS="${RESTORE_PORT_RESERVATION_LOCK_TIMEOUT_SECONDS:-30}"
 RESTORE_IP_LOCAL_RESERVED_PORTS_PATH="${RESTORE_IP_LOCAL_RESERVED_PORTS_PATH:-/proc/sys/net/ipv4/ip_local_reserved_ports}"
+
+# Some checkpoint states contain more saved TCP payload than the kernel's
+# default receive window can accept during DMTCP stream refill. Immediately
+# before restore, the runner transactionally raises these values, keeps them
+# active through every attempt, and restores the exact previous values after
+# all clients reach RUNNING or on any failure/signal cleanup path.
+RESTORE_TUNE_TCP_RECEIVE_WINDOW="${RESTORE_TUNE_TCP_RECEIVE_WINDOW:-true}"
+RESTORE_TCP_RECEIVE_WINDOW_LOCK_FILE="${RESTORE_TCP_RECEIVE_WINDOW_LOCK_FILE:-/run/lock/npb_dmtcp_restore_tcp_receive_window.lock}"
+RESTORE_TCP_RECEIVE_WINDOW_LOCK_TIMEOUT_SECONDS="${RESTORE_TCP_RECEIVE_WINDOW_LOCK_TIMEOUT_SECONDS:-30}"
+RESTORE_NET_CORE_RMEM_MAX="${RESTORE_NET_CORE_RMEM_MAX:-16777216}"
+RESTORE_NET_IPV4_TCP_RMEM="${RESTORE_NET_IPV4_TCP_RMEM:-4096 4194304 16777216}"
+RESTORE_NET_CORE_RMEM_MAX_PATH="${RESTORE_NET_CORE_RMEM_MAX_PATH:-/proc/sys/net/core/rmem_max}"
+RESTORE_NET_IPV4_TCP_RMEM_PATH="${RESTORE_NET_IPV4_TCP_RMEM_PATH:-/proc/sys/net/ipv4/tcp_rmem}"
 
 POST_CHECKPOINT_STABILIZATION_SECONDS="${POST_CHECKPOINT_STABILIZATION_SECONDS:-2}"
 
