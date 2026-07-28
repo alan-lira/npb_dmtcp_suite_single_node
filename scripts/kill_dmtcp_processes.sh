@@ -7,44 +7,93 @@
 
 set -euo pipefail
 
-# Emergency cleanup for abandoned runs owned by the current user.
-# This intentionally affects every matching DMTCP/MPI/NPB process owned by the
-# user, so do not use it while another experiment is meant to remain active.
+# Emergency cleanup for abandoned runs owned by the current user. Matching is
+# based on the actual executable basename or process comm value, not arbitrary
+# substrings elsewhere in a caller's command line. The helper and its complete
+# caller ancestry are always excluded.
 
-PROCESS_PATTERN='dmtcp_coordinator|dmtcp_launch|DMTCP:|hydra|mpiexec|mpirun|bt\.[A-F]\.x|cg\.[A-F]\.x'
 CURRENT_USER="${USER:-$(id -un)}"
+CURRENT_UID="$(id -u "${CURRENT_USER}")"
+
+matching_processes() {
+  python3 - "${CURRENT_UID}" <<'PY'
+from pathlib import Path
+import os
+import re
+import sys
+
+uid = int(sys.argv[1])
+proc = Path('/proc')
+exact = re.compile(
+    r'^(?:dmtcp_coordinator|dmtcp_launch|dmtcp_restart|hydra_pmi_proxy|'
+    r'mpiexec(?:\.hydra)?|mpirun|bt\.[A-F]\.x|cg\.[A-F]\.x)$'
+)
+
+excluded = set()
+pid = os.getpid()
+while pid > 0 and pid not in excluded:
+    excluded.add(pid)
+    try:
+        raw = (proc / str(pid) / 'stat').read_text()
+        right = raw.rfind(')')
+        fields = raw[right + 2:].split()
+        pid = int(fields[1])
+    except (OSError, ValueError, IndexError):
+        break
+
+for entry in proc.iterdir():
+    if not entry.name.isdigit():
+        continue
+    pid = int(entry.name)
+    if pid in excluded:
+        continue
+    try:
+        if entry.stat().st_uid != uid:
+            continue
+        comm = (entry / 'comm').read_text(errors='replace').strip()
+        raw = (entry / 'cmdline').read_bytes()
+    except OSError:
+        continue
+    argv0 = raw.split(b'\0', 1)[0].decode(errors='replace') if raw else ''
+    basename = os.path.basename(argv0)
+    if comm.startswith('DMTCP:') or exact.fullmatch(comm) or exact.fullmatch(basename):
+        command = raw.replace(b'\0', b' ').decode(errors='replace').strip() or comm
+        print(f'{pid}\t{command}')
+PY
+}
+
+matching_pids() {
+  matching_processes | cut -f1
+}
+
+signal_matches() {
+  local signal_name="$1"
+  local -a pids=()
+  mapfile -t pids < <(matching_pids)
+  [ "${#pids[@]}" -eq 0 ] || kill "-${signal_name}" -- "${pids[@]}" 2>/dev/null || true
+}
 
 echo "Matching processes owned by ${CURRENT_USER}:"
-pgrep -a -u "${CURRENT_USER}" -f "${PROCESS_PATTERN}" || echo "None"
+if ! matching_processes | sed 's/^/  /' | grep -q .; then
+  echo "None"
+else
+  matching_processes | sed 's/^/  /'
+fi
 
 echo
 echo "Requesting graceful termination..."
-pkill -TERM -u "${CURRENT_USER}" -f 'dmtcp_coordinator' 2>/dev/null || true
-pkill -TERM -u "${CURRENT_USER}" -f 'dmtcp_launch' 2>/dev/null || true
-pkill -TERM -u "${CURRENT_USER}" -f 'DMTCP:' 2>/dev/null || true
-pkill -TERM -u "${CURRENT_USER}" -f 'hydra' 2>/dev/null || true
-pkill -TERM -u "${CURRENT_USER}" -f 'mpiexec' 2>/dev/null || true
-pkill -TERM -u "${CURRENT_USER}" -f 'mpirun' 2>/dev/null || true
-pkill -TERM -u "${CURRENT_USER}" -f 'bt\.[A-F]\.x' 2>/dev/null || true
-pkill -TERM -u "${CURRENT_USER}" -f 'cg\.[A-F]\.x' 2>/dev/null || true
-
+signal_matches TERM
 sleep 2
 
 echo "Force-killing any remaining matching processes..."
-pkill -KILL -u "${CURRENT_USER}" -f 'dmtcp_coordinator' 2>/dev/null || true
-pkill -KILL -u "${CURRENT_USER}" -f 'dmtcp_launch' 2>/dev/null || true
-pkill -KILL -u "${CURRENT_USER}" -f 'DMTCP:' 2>/dev/null || true
-pkill -KILL -u "${CURRENT_USER}" -f 'hydra' 2>/dev/null || true
-pkill -KILL -u "${CURRENT_USER}" -f 'mpiexec' 2>/dev/null || true
-pkill -KILL -u "${CURRENT_USER}" -f 'mpirun' 2>/dev/null || true
-pkill -KILL -u "${CURRENT_USER}" -f 'bt\.[A-F]\.x' 2>/dev/null || true
-pkill -KILL -u "${CURRENT_USER}" -f 'cg\.[A-F]\.x' 2>/dev/null || true
-
+signal_matches KILL
 sleep 1
 
 echo
 echo "Remaining matching processes:"
-if pgrep -a -u "${CURRENT_USER}" -f "${PROCESS_PATTERN}"; then
+mapfile -t remaining < <(matching_processes)
+if [ "${#remaining[@]}" -gt 0 ]; then
+  printf '  %s\n' "${remaining[@]}"
   echo "ERROR: Matching DMTCP/MPI/NPB processes remain after cleanup." >&2
   exit 1
 fi

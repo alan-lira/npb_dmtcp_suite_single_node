@@ -12,6 +12,8 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/experiment_config.sh"
 
 ADAPTIVE_CLEANUP_HELPER="${SCRIPT_DIR}/adaptive_pre_restore_cleanup.py"
+RESTORE_PORT_RESERVATION_HELPER="${SCRIPT_DIR}/restore_port_reservation.py"
+RESTORE_TCP_RECEIVE_WINDOW_HELPER="${SCRIPT_DIR}/restore_tcp_receive_window.py"
 
 usage() {
   cat <<USAGE
@@ -160,7 +162,9 @@ for positive_setting in \
   PRE_RESTORE_CLEANUP_TIMEOUT_SECONDS \
   PRE_RESTORE_CLEANUP_POLL_SECONDS \
   PRE_RESTORE_CLEANUP_REPORT_INTERVAL_SECONDS \
-  RESTORE_BIND_FAILURE_ABORT_SECONDS; do
+  RESTORE_BIND_FAILURE_ABORT_SECONDS \
+  RESTORE_PORT_RESERVATION_LOCK_TIMEOUT_SECONDS \
+  RESTORE_TCP_RECEIVE_WINDOW_LOCK_TIMEOUT_SECONDS; do
   is_positive_number "${!positive_setting}" \
     || fail "${positive_setting} must be a positive number; received '${!positive_setting}'."
 done
@@ -177,8 +181,38 @@ done
 is_positive_integer "${RESTORE_MAX_ATTEMPTS}" \
   || fail "RESTORE_MAX_ATTEMPTS must be a positive integer; received '${RESTORE_MAX_ATTEMPTS}'."
 
+case "${RESTORE_RESERVE_ORIGINAL_TCP_PORTS}" in
+  true|false) ;;
+  *) fail "RESTORE_RESERVE_ORIGINAL_TCP_PORTS must be true or false." ;;
+esac
+
+case "${RESTORE_TUNE_TCP_RECEIVE_WINDOW}" in
+  true|false) ;;
+  *) fail "RESTORE_TUNE_TCP_RECEIVE_WINDOW must be true or false." ;;
+esac
+
+is_positive_integer "${RESTORE_NET_CORE_RMEM_MAX}" \
+  || fail "RESTORE_NET_CORE_RMEM_MAX must be a positive integer; received '${RESTORE_NET_CORE_RMEM_MAX}'."
+
+python3 - "${RESTORE_NET_IPV4_TCP_RMEM}" <<'PY_VALIDATE_TCP_RMEM' \
+  || fail "RESTORE_NET_IPV4_TCP_RMEM must contain three positive integers satisfying minimum <= default <= maximum."
+import sys
+fields = sys.argv[1].split()
+if len(fields) != 3:
+    raise SystemExit(1)
+try:
+    values = [int(field) for field in fields]
+except ValueError:
+    raise SystemExit(1)
+raise SystemExit(0 if all(value > 0 for value in values) and values[0] <= values[1] <= values[2] else 1)
+PY_VALIDATE_TCP_RMEM
+
 [ -x "${ADAPTIVE_CLEANUP_HELPER}" ] \
   || fail "adaptive cleanup helper is missing or not executable: ${ADAPTIVE_CLEANUP_HELPER}"
+[ -x "${RESTORE_PORT_RESERVATION_HELPER}" ] \
+  || fail "restore port-reservation helper is missing or not executable: ${RESTORE_PORT_RESERVATION_HELPER}"
+[ -x "${RESTORE_TCP_RECEIVE_WINDOW_HELPER}" ] \
+  || fail "restore TCP receive-window helper is missing or not executable: ${RESTORE_TCP_RECEIVE_WINDOW_HELPER}"
 python3 - <<'PY' \
   || fail "Python/Linux pidfd support is required for PID-reuse-safe cleanup escalation."
 import os
@@ -238,7 +272,7 @@ if ! verify_single_node_stack; then
   fail "the expected single-node DMTCP/MPICH stack is not active."
 fi
 
-for command_name in mpirun dmtcp_coordinator dmtcp_launch dmtcp_command python3 pgrep ps; do
+for command_name in mpirun dmtcp_coordinator dmtcp_launch dmtcp_command python3 pgrep ps flock; do
   command -v "${command_name}" >/dev/null 2>&1 \
     || fail "required command unavailable after sourcing ${ENV_FILE}: ${command_name}"
 done
@@ -326,6 +360,12 @@ COORD_PID=""
 RESTORED_PID=""
 PORT=""
 CLEANUP_DONE=0
+RESTORE_PORT_RESERVATION_ACTIVE=0
+RESTORE_PORT_RESERVATION_LOCK_FD=""
+RESTORE_PORT_RESERVATION_STATE="${RUN_DIR}/restore_port_reservation_state.json"
+RESTORE_TCP_RECEIVE_WINDOW_ACTIVE=0
+RESTORE_TCP_RECEIVE_WINDOW_LOCK_FD=""
+RESTORE_TCP_RECEIVE_WINDOW_STATE="${RUN_DIR}/restore_tcp_receive_window_state.json"
 EXPECTED_DMTCP_CLIENTS=$((NP + 2))
 
 now_ns() {
@@ -428,6 +468,182 @@ terminate_process_tree() {
   [ "${#ids[@]}" -eq 0 ] || kill "-${signal_name}" -- "${ids[@]}" 2>/dev/null || true
 }
 
+release_restore_tcp_receive_window() {
+  local release_status=0
+
+  if [ "${RESTORE_TCP_RECEIVE_WINDOW_ACTIVE}" -eq 1 ] && \
+     [ -f "${RESTORE_TCP_RECEIVE_WINDOW_STATE}" ]; then
+    phase restore "Restoring the previous net.core.rmem_max and net.ipv4.tcp_rmem values."
+    set +e
+    python3 "${RESTORE_TCP_RECEIVE_WINDOW_HELPER}" release \
+      --state "${RESTORE_TCP_RECEIVE_WINDOW_STATE}" \
+      --rmem-max-path "${RESTORE_NET_CORE_RMEM_MAX_PATH}" \
+      --tcp-rmem-path "${RESTORE_NET_IPV4_TCP_RMEM_PATH}" \
+      --released-rmem-max-output "${RUN_DIR}/restore_tcp_receive_window_released_rmem_max.txt" \
+      --released-tcp-rmem-output "${RUN_DIR}/restore_tcp_receive_window_released_tcp_rmem.txt" \
+      > "${RUN_DIR}/restore_tcp_receive_window_release.log" 2>&1
+    release_status=$?
+    set -e
+    cat "${RUN_DIR}/restore_tcp_receive_window_release.log" 2>/dev/null || true
+    if [ "${release_status}" -eq 0 ]; then
+      printf '%s\n' "RELEASED" > "${RUN_DIR}/restore_tcp_receive_window_status.txt"
+      RESTORE_TCP_RECEIVE_WINDOW_ACTIVE=0
+    else
+      printf '%s\n' "RELEASE_FAILED" > "${RUN_DIR}/restore_tcp_receive_window_status.txt"
+    fi
+  fi
+
+  if [ "${release_status}" -eq 0 ] && \
+     [ -n "${RESTORE_TCP_RECEIVE_WINDOW_LOCK_FD}" ]; then
+    flock -u "${RESTORE_TCP_RECEIVE_WINDOW_LOCK_FD}" 2>/dev/null || true
+    eval "exec ${RESTORE_TCP_RECEIVE_WINDOW_LOCK_FD}>&-"
+    RESTORE_TCP_RECEIVE_WINDOW_LOCK_FD=""
+  fi
+
+  return "${release_status}"
+}
+
+apply_restore_tcp_receive_window() {
+  local lock_parent
+  local prepare_status
+
+  if [ "${RESTORE_TUNE_TCP_RECEIVE_WINDOW}" = "false" ]; then
+    phase restore "Restore-scoped TCP receive-window tuning is disabled by configuration."
+    printf '%s\n' "DISABLED" > "${RUN_DIR}/restore_tcp_receive_window_status.txt"
+    return 0
+  fi
+
+  [ -r "${RESTORE_NET_CORE_RMEM_MAX_PATH}" ] \
+    || fail "cannot read net.core.rmem_max path: ${RESTORE_NET_CORE_RMEM_MAX_PATH}"
+  [ -w "${RESTORE_NET_CORE_RMEM_MAX_PATH}" ] \
+    || fail "cannot write net.core.rmem_max path: ${RESTORE_NET_CORE_RMEM_MAX_PATH}; run with sufficient privilege or set RESTORE_TUNE_TCP_RECEIVE_WINDOW=false only for a deliberate comparison."
+  [ -r "${RESTORE_NET_IPV4_TCP_RMEM_PATH}" ] \
+    || fail "cannot read net.ipv4.tcp_rmem path: ${RESTORE_NET_IPV4_TCP_RMEM_PATH}"
+  [ -w "${RESTORE_NET_IPV4_TCP_RMEM_PATH}" ] \
+    || fail "cannot write net.ipv4.tcp_rmem path: ${RESTORE_NET_IPV4_TCP_RMEM_PATH}; run with sufficient privilege or set RESTORE_TUNE_TCP_RECEIVE_WINDOW=false only for a deliberate comparison."
+
+  lock_parent="$(dirname -- "${RESTORE_TCP_RECEIVE_WINDOW_LOCK_FILE}")"
+  mkdir -p -- "${lock_parent}"
+  exec {RESTORE_TCP_RECEIVE_WINDOW_LOCK_FD}> "${RESTORE_TCP_RECEIVE_WINDOW_LOCK_FILE}"
+  if ! flock -w "${RESTORE_TCP_RECEIVE_WINDOW_LOCK_TIMEOUT_SECONDS}" \
+      "${RESTORE_TCP_RECEIVE_WINDOW_LOCK_FD}"; then
+    eval "exec ${RESTORE_TCP_RECEIVE_WINDOW_LOCK_FD}>&-"
+    RESTORE_TCP_RECEIVE_WINDOW_LOCK_FD=""
+    fail "timed out waiting for restore TCP receive-window lock: ${RESTORE_TCP_RECEIVE_WINDOW_LOCK_FILE}"
+  fi
+
+  phase restore "Applying restore-scoped TCP receive-window floors before DMTCP reconnects sockets."
+  RESTORE_TCP_RECEIVE_WINDOW_ACTIVE=1
+  printf '%s\n' "PREPARING" > "${RUN_DIR}/restore_tcp_receive_window_status.txt"
+  set +e
+  python3 "${RESTORE_TCP_RECEIVE_WINDOW_HELPER}" prepare \
+    --state "${RESTORE_TCP_RECEIVE_WINDOW_STATE}" \
+    --rmem-max-path "${RESTORE_NET_CORE_RMEM_MAX_PATH}" \
+    --tcp-rmem-path "${RESTORE_NET_IPV4_TCP_RMEM_PATH}" \
+    --target-rmem-max "${RESTORE_NET_CORE_RMEM_MAX}" \
+    --target-tcp-rmem "${RESTORE_NET_IPV4_TCP_RMEM}" \
+    --original-rmem-max-output "${RUN_DIR}/restore_tcp_receive_window_original_rmem_max.txt" \
+    --original-tcp-rmem-output "${RUN_DIR}/restore_tcp_receive_window_original_tcp_rmem.txt" \
+    --applied-rmem-max-output "${RUN_DIR}/restore_tcp_receive_window_applied_rmem_max.txt" \
+    --applied-tcp-rmem-output "${RUN_DIR}/restore_tcp_receive_window_applied_tcp_rmem.txt" \
+    > "${RUN_DIR}/restore_tcp_receive_window_prepare.log" 2>&1
+  prepare_status=$?
+  set -e
+  cat "${RUN_DIR}/restore_tcp_receive_window_prepare.log" 2>/dev/null || true
+  if [ "${prepare_status}" -ne 0 ]; then
+    printf '%s\n' "PREPARE_FAILED" > "${RUN_DIR}/restore_tcp_receive_window_status.txt"
+    if ! release_restore_tcp_receive_window; then
+      fail "could not apply restore-scoped TCP receive-window settings, and exact rollback also failed."
+    fi
+    fail "could not apply restore-scoped TCP receive-window settings; the previous values were restored."
+  fi
+
+  printf '%s\n' "ACTIVE" > "${RUN_DIR}/restore_tcp_receive_window_status.txt"
+}
+
+release_restore_ports() {
+  local release_status=0
+
+  if [ "${RESTORE_PORT_RESERVATION_ACTIVE}" -eq 1 ] && \
+     [ -f "${RESTORE_PORT_RESERVATION_STATE}" ]; then
+    phase restore "Restoring the previous net.ipv4.ip_local_reserved_ports value."
+    set +e
+    python3 "${RESTORE_PORT_RESERVATION_HELPER}" release \
+      --state "${RESTORE_PORT_RESERVATION_STATE}" \
+      --sysctl-path "${RESTORE_IP_LOCAL_RESERVED_PORTS_PATH}" \
+      --release-output "${RUN_DIR}/restore_port_reservation_released_value.txt" \
+      > "${RUN_DIR}/restore_port_reservation_release.log" 2>&1
+    release_status=$?
+    set -e
+    cat "${RUN_DIR}/restore_port_reservation_release.log" 2>/dev/null || true
+    if [ "${release_status}" -eq 0 ]; then
+      printf '%s\n' "RELEASED" > "${RUN_DIR}/restore_port_reservation_status.txt"
+      RESTORE_PORT_RESERVATION_ACTIVE=0
+    else
+      printf '%s\n' "RELEASE_FAILED" > "${RUN_DIR}/restore_port_reservation_status.txt"
+    fi
+  fi
+
+  if [ "${release_status}" -eq 0 ] && \
+     [ -n "${RESTORE_PORT_RESERVATION_LOCK_FD}" ]; then
+    flock -u "${RESTORE_PORT_RESERVATION_LOCK_FD}" 2>/dev/null || true
+    eval "exec ${RESTORE_PORT_RESERVATION_LOCK_FD}>&-"
+    RESTORE_PORT_RESERVATION_LOCK_FD=""
+  fi
+
+  return "${release_status}"
+}
+
+reserve_restore_ports() {
+  local lock_parent
+  local prepare_status
+
+  if [ "${RESTORE_RESERVE_ORIGINAL_TCP_PORTS}" = "false" ]; then
+    phase restore "Captured TCP-listener port reservation is disabled by configuration."
+    printf '%s\n' "DISABLED" > "${RUN_DIR}/restore_port_reservation_status.txt"
+    return 0
+  fi
+
+  [ -r "${RESTORE_IP_LOCAL_RESERVED_PORTS_PATH}" ] \
+    || fail "cannot read restore port-reservation sysctl: ${RESTORE_IP_LOCAL_RESERVED_PORTS_PATH}"
+  [ -w "${RESTORE_IP_LOCAL_RESERVED_PORTS_PATH}" ] \
+    || fail "cannot write restore port-reservation sysctl: ${RESTORE_IP_LOCAL_RESERVED_PORTS_PATH}; run with sufficient privilege or set RESTORE_RESERVE_ORIGINAL_TCP_PORTS=false for a deliberate comparison."
+
+  lock_parent="$(dirname -- "${RESTORE_PORT_RESERVATION_LOCK_FILE}")"
+  mkdir -p -- "${lock_parent}"
+  exec {RESTORE_PORT_RESERVATION_LOCK_FD}> "${RESTORE_PORT_RESERVATION_LOCK_FILE}"
+  if ! flock -w "${RESTORE_PORT_RESERVATION_LOCK_TIMEOUT_SECONDS}" \
+      "${RESTORE_PORT_RESERVATION_LOCK_FD}"; then
+    eval "exec ${RESTORE_PORT_RESERVATION_LOCK_FD}>&-"
+    RESTORE_PORT_RESERVATION_LOCK_FD=""
+    fail "timed out waiting for restore port-reservation lock: ${RESTORE_PORT_RESERVATION_LOCK_FILE}"
+  fi
+
+  phase restore "Reserving captured IPv4 TCP listener ports against temporary bind(port=0) allocation."
+  set +e
+  python3 "${RESTORE_PORT_RESERVATION_HELPER}" prepare \
+    --capture-state "${CLEANUP_STATE}" \
+    --state "${RESTORE_PORT_RESERVATION_STATE}" \
+    --sysctl-path "${RESTORE_IP_LOCAL_RESERVED_PORTS_PATH}" \
+    --ports-output "${RUN_DIR}/restore_reserved_tcp_listener_ports.txt" \
+    --original-output "${RUN_DIR}/restore_port_reservation_original_value.txt" \
+    --applied-output "${RUN_DIR}/restore_port_reservation_applied_value.txt" \
+    > "${RUN_DIR}/restore_port_reservation_prepare.log" 2>&1
+  prepare_status=$?
+  set -e
+  cat "${RUN_DIR}/restore_port_reservation_prepare.log"
+  if [ "${prepare_status}" -ne 0 ]; then
+    printf '%s\n' "PREPARE_FAILED" > "${RUN_DIR}/restore_port_reservation_status.txt"
+    flock -u "${RESTORE_PORT_RESERVATION_LOCK_FD}" 2>/dev/null || true
+    eval "exec ${RESTORE_PORT_RESERVATION_LOCK_FD}>&-"
+    RESTORE_PORT_RESERVATION_LOCK_FD=""
+    fail "could not reserve captured TCP listener ports before restore."
+  fi
+
+  RESTORE_PORT_RESERVATION_ACTIVE=1
+  printf '%s\n' "ACTIVE" > "${RUN_DIR}/restore_port_reservation_status.txt"
+}
+
 cleanup() {
   if [ "${CLEANUP_DONE}" -eq 1 ]; then
     return
@@ -451,6 +667,8 @@ cleanup() {
   for pid in "${RESTORED_PID}" "${APP_PID}" "${COORD_PID}"; do
     [ -z "${pid}" ] || wait "${pid}" 2>/dev/null || true
   done
+  release_restore_ports || true
+  release_restore_tcp_receive_window || true
   set -e
 }
 
@@ -952,14 +1170,17 @@ PY
 cleanup_failed_restore_attempt() {
   local attempt_number="$1"
   local attempt_dir="$2"
+  local apply_retry_grace="${3:-true}"
   local retry_cleanup_dir="${attempt_dir}/retry_cleanup"
   local cleanup_state="${retry_cleanup_dir}/captured_state.json"
   local capture_status=1
   local adaptive_status=1
   local wrapper_status=0
+  local adaptive_cleanup_pid=""
+  local wrapper_state=""
 
   mkdir -p "${retry_cleanup_dir}"
-  phase cleanup "Cleaning failed restore attempt ${attempt_number}/${RESTORE_MAX_ATTEMPTS} before reusing the same checkpoint."
+  phase cleanup "Cleaning failed restore attempt ${attempt_number}/${RESTORE_MAX_ATTEMPTS} using only processes captured for that attempt."
 
   if [ -n "${RESTORED_PID}" ] && pid_is_active "${RESTORED_PID}"; then
     set +e
@@ -972,56 +1193,80 @@ cleanup_failed_restore_attempt() {
     capture_status=$?
     set -e
   else
-    printf '%s\n' "Restart wrapper was no longer active at retry cleanup." \
+    printf '%s\n' "Restart wrapper was no longer active before exact retry capture." \
       > "${retry_cleanup_dir}/capture.log"
   fi
 
-  if [ -n "${PORT}" ]; then
-    dmtcp_command --coord-port "${PORT}" --kill >/dev/null 2>&1 || true
+  if [ "${capture_status}" -ne 0 ]; then
+    printf '%s\n' "exact_capture_failed_no_broad_sweep" \
+      > "${retry_cleanup_dir}/cleanup_mode.txt"
+    phase cleanup "Could not capture the failed restore tree exactly; refusing a broad process sweep."
+    return 1
   fi
 
-  if [ "${capture_status}" -eq 0 ]; then
-    set +e
-    python3 "${ADAPTIVE_CLEANUP_HELPER}" cleanup \
-      --state "${cleanup_state}" \
-      --metrics-dir "${retry_cleanup_dir}" \
-      --timeout "${PRE_RESTORE_CLEANUP_TIMEOUT_SECONDS}" \
-      --poll "${PRE_RESTORE_CLEANUP_POLL_SECONDS}" \
-      --force-kill-after "${PRE_RESTORE_FORCE_KILL_AFTER_SECONDS}" \
-      --force-kill-grace "${PRE_RESTORE_FORCE_KILL_GRACE_SECONDS}" \
-      --final-grace "0" \
-      --report-interval "${PRE_RESTORE_CLEANUP_REPORT_INTERVAL_SECONDS}" \
-      > "${retry_cleanup_dir}/adaptive_cleanup.log" 2>&1
-    adaptive_status=$?
-    set -e
-    cat "${retry_cleanup_dir}/adaptive_cleanup.log"
-  else
-    phase cleanup "Could not capture the failed restore process tree exactly; using emergency process cleanup and explicit retry grace."
+  phase cleanup "Starting exact adaptive cleanup for failed restore attempt ${attempt_number}."
+  set +e
+  python3 "${ADAPTIVE_CLEANUP_HELPER}" cleanup \
+    --state "${cleanup_state}" \
+    --metrics-dir "${retry_cleanup_dir}" \
+    --timeout "${PRE_RESTORE_CLEANUP_TIMEOUT_SECONDS}" \
+    --poll "${PRE_RESTORE_CLEANUP_POLL_SECONDS}" \
+    --force-kill-after "${PRE_RESTORE_FORCE_KILL_AFTER_SECONDS}" \
+    --force-kill-grace "${PRE_RESTORE_FORCE_KILL_GRACE_SECONDS}" \
+    --final-grace "0" \
+    --report-interval "${PRE_RESTORE_CLEANUP_REPORT_INTERVAL_SECONDS}" \
+    > "${retry_cleanup_dir}/adaptive_cleanup.log" 2>&1 &
+  adaptive_cleanup_pid=$!
+  phase cleanup "Adaptive cleanup helper PID: ${adaptive_cleanup_pid}."
+
+  # The restart wrapper is a direct child of this shell. Reap it while the
+  # adaptive helper runs so a captured zombie cannot keep the helper waiting.
+  while kill -0 "${adaptive_cleanup_pid}" 2>/dev/null; do
+    if [ -n "${RESTORED_PID}" ]; then
+      wrapper_state=""
+      if [ -r "/proc/${RESTORED_PID}/stat" ]; then
+        wrapper_state="$(awk '{print $3}' "/proc/${RESTORED_PID}/stat" 2>/dev/null || true)"
+      fi
+      if [ "${wrapper_state}" = "Z" ] || \
+         ! kill -0 "${RESTORED_PID}" 2>/dev/null; then
+        wait "${RESTORED_PID}" >/dev/null 2>&1
+        wrapper_status=$?
+        printf '%s\n' "${wrapper_status}" \
+          > "${retry_cleanup_dir}/restart_wrapper_exit_status.txt"
+        RESTORED_PID=""
+      fi
+    fi
+    sleep "${PRE_RESTORE_CLEANUP_POLL_SECONDS}"
+  done
+
+  wait "${adaptive_cleanup_pid}"
+  adaptive_status=$?
+  set -e
+  cat "${retry_cleanup_dir}/adaptive_cleanup.log"
+
+  if [ "${adaptive_status}" -ne 0 ]; then
+    printf '%s\n' "exact_adaptive_cleanup_failed" \
+      > "${retry_cleanup_dir}/cleanup_mode.txt"
+    return 1
   fi
 
   if [ -n "${RESTORED_PID}" ]; then
-    terminate_process_tree "${RESTORED_PID}" TERM
-    sleep 1
-    terminate_process_tree "${RESTORED_PID}" KILL
+    if pid_is_active "${RESTORED_PID}"; then
+      printf '%s\n' "captured wrapper remained active after adaptive cleanup" \
+        > "${retry_cleanup_dir}/wrapper_cleanup_error.txt"
+      return 1
+    fi
     set +e
-    wait "${RESTORED_PID}"
+    wait "${RESTORED_PID}" >/dev/null 2>&1
     wrapper_status=$?
     set -e
-    printf '%s\n' "${wrapper_status}" > "${retry_cleanup_dir}/restart_wrapper_exit_status.txt"
+    printf '%s\n' "${wrapper_status}" \
+      > "${retry_cleanup_dir}/restart_wrapper_exit_status.txt"
     RESTORED_PID=""
   fi
 
-  if ! "${SCRIPT_DIR}/kill_dmtcp_processes.sh" \
-      > "${retry_cleanup_dir}/emergency_process_cleanup.log" 2>&1; then
-    cat "${retry_cleanup_dir}/emergency_process_cleanup.log" >&2
-    return 1
-  fi
-
-  if [ "${capture_status}" -eq 0 ] && [ "${adaptive_status}" -ne 0 ]; then
-    return 1
-  fi
-
-  if python3 - "${RESTORE_RETRY_FINAL_GRACE_SECONDS}" <<'PY'
+  if [ "${apply_retry_grace}" = "true" ] && \
+     python3 - "${RESTORE_RETRY_FINAL_GRACE_SECONDS}" <<'PY'
 import sys
 raise SystemExit(0 if float(sys.argv[1]) > 0 else 1)
 PY
@@ -1030,12 +1275,8 @@ PY
     sleep "${RESTORE_RETRY_FINAL_GRACE_SECONDS}"
   fi
 
-  if [ "${capture_status}" -eq 0 ]; then
-    printf '%s\n' "adaptive_endpoint_cleanup_plus_emergency_sweep" \
-      > "${retry_cleanup_dir}/cleanup_mode.txt"
-  else
-    printf '%s\n' "fallback_process_cleanup" > "${retry_cleanup_dir}/cleanup_mode.txt"
-  fi
+  printf '%s\n' "exact_captured_tree_and_endpoint_cleanup" \
+    > "${retry_cleanup_dir}/cleanup_mode.txt"
   return 0
 }
 
@@ -1060,7 +1301,8 @@ PY
   echo "Binary: ${NPB_BIN}"
   echo "DMTCP commit: ${DMTCP_COMMIT:-unknown}"
   echo "DMTCP restore listener backlog: ${DMTCP_RESTORE_LISTEN_BACKLOG:-unknown}"
-  echo "DMTCP duplex stream refill patch: ${DMTCP_DUPLEX_REFILL_PATCH_ACTIVE:-unknown}"
+  echo "DMTCP restore listener paths patched: ${DMTCP_RESTORE_LISTENER_PATHS:-unknown}"
+  echo "DMTCP receive-capacity duplex refill patch: ${DMTCP_DUPLEX_REFILL_PATCH_ACTIVE:-unknown}"
   echo "DMTCP IPC plugin: ${DMTCP_IPC_PLUGIN_PATH:-unknown}"
   echo "DMTCP IPC plugin SHA256: ${DMTCP_IPC_PLUGIN_SHA256:-unknown}"
   echo "Kernel net.core.somaxconn: $(cat /proc/sys/net/core/somaxconn)"
@@ -1078,6 +1320,17 @@ PY
   echo "Restore bind-failure abort seconds: ${RESTORE_BIND_FAILURE_ABORT_SECONDS}"
   echo "Restore maximum attempts: ${RESTORE_MAX_ATTEMPTS}"
   echo "Restore retry final verified-clear grace seconds: ${RESTORE_RETRY_FINAL_GRACE_SECONDS}"
+  echo "Reserve original TCP listener ports during restore: ${RESTORE_RESERVE_ORIGINAL_TCP_PORTS}"
+  echo "Restore port-reservation lock file: ${RESTORE_PORT_RESERVATION_LOCK_FILE}"
+  echo "Restore port-reservation lock timeout seconds: ${RESTORE_PORT_RESERVATION_LOCK_TIMEOUT_SECONDS}"
+  echo "Restore reserved-ports sysctl: ${RESTORE_IP_LOCAL_RESERVED_PORTS_PATH}"
+  echo "Tune TCP receive window during restore: ${RESTORE_TUNE_TCP_RECEIVE_WINDOW}"
+  echo "Restore TCP receive-window lock file: ${RESTORE_TCP_RECEIVE_WINDOW_LOCK_FILE}"
+  echo "Restore TCP receive-window lock timeout seconds: ${RESTORE_TCP_RECEIVE_WINDOW_LOCK_TIMEOUT_SECONDS}"
+  echo "Restore net.core.rmem_max floor: ${RESTORE_NET_CORE_RMEM_MAX}"
+  echo "Restore net.ipv4.tcp_rmem floor: ${RESTORE_NET_IPV4_TCP_RMEM}"
+  echo "Restore net.core.rmem_max path: ${RESTORE_NET_CORE_RMEM_MAX_PATH}"
+  echo "Restore net.ipv4.tcp_rmem path: ${RESTORE_NET_IPV4_TCP_RMEM_PATH}"
 } > run_metadata.txt
 
 printf '%s\n' "${CHECKPOINT_MODE}" > checkpoint_mode.txt
@@ -1337,6 +1590,8 @@ phase cleanup "Adaptive pre-restore cleanup completed in $(human_seconds "$(<pre
 chmod +x "${RESTART_SCRIPT}"
 
 RESTORE_START_NS="$(now_ns)"
+apply_restore_tcp_receive_window
+reserve_restore_ports
 phase restore "Restoring checkpoints using script: ${RESTART_SCRIPT_ABS}"
 phase restore "The generated script will launch a new coordinator and restore ${EXPECTED_DMTCP_CLIENTS} DMTCP clients."
 phase restore "Up to ${RESTORE_MAX_ATTEMPTS} attempts will reuse this same checkpoint if a restore attempt stalls or exits before RUNNING."
@@ -1360,7 +1615,12 @@ for (( RESTORE_ATTEMPT=1; RESTORE_ATTEMPT<=RESTORE_MAX_ATTEMPTS; RESTORE_ATTEMPT
 
   phase restore "Attempt ${RESTORE_ATTEMPT}/${RESTORE_MAX_ATTEMPTS} failed: ${ATTEMPT_FAILURE_MESSAGE}."
 
-  if ! cleanup_failed_restore_attempt "${RESTORE_ATTEMPT}" "${ATTEMPT_DIR}"; then
+  APPLY_RETRY_GRACE="true"
+  if [ "${RESTORE_ATTEMPT}" -ge "${RESTORE_MAX_ATTEMPTS}" ]; then
+    APPLY_RETRY_GRACE="false"
+  fi
+
+  if ! cleanup_failed_restore_attempt "${RESTORE_ATTEMPT}" "${ATTEMPT_DIR}" "${APPLY_RETRY_GRACE}"; then
     echo "0" > dmtcp_restore_marker_found.txt
     echo "FAILED" > run_status.txt
     fail "failed restore attempt ${RESTORE_ATTEMPT} could not be cleaned safely; no further attempt was launched."
@@ -1387,6 +1647,16 @@ if [ "${RESTORE_FOUND}" -ne 1 ] || [ "${SUCCESSFUL_RESTORE_ATTEMPT}" -le 0 ]; th
   echo "0" > dmtcp_restore_marker_found.txt
   echo "FAILED" > run_status.txt
   fail "all ${RESTORE_MAX_ATTEMPTS} restore attempts failed; checkpoint images and per-attempt diagnostics were preserved."
+fi
+
+if ! release_restore_ports; then
+  echo "FAILED" > run_status.txt
+  fail "restore succeeded, but the previous reserved-port setting could not be restored safely."
+fi
+
+if ! release_restore_tcp_receive_window; then
+  echo "FAILED" > run_status.txt
+  fail "restore succeeded, but the previous TCP receive-window sysctls could not be restored safely."
 fi
 
 RESTORE_END_NS="$(now_ns)"

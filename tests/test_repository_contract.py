@@ -28,6 +28,8 @@ def main() -> int:
     run_one = (SCRIPTS / "run_one.sh").read_text()
     summarizer = (SCRIPTS / "summarize_results.py").read_text()
     cleanup = (SCRIPTS / "adaptive_pre_restore_cleanup.py").read_text()
+    reservation = (SCRIPTS / "restore_port_reservation.py").read_text()
+    receive_window = (SCRIPTS / "restore_tcp_receive_window.py").read_text()
     readme = (REPO_ROOT / "README.md").read_text()
     patch_dir = (
         REPO_ROOT
@@ -47,11 +49,11 @@ def main() -> int:
     backlog_patch_sha256 = hashlib.sha256(backlog_patch_path.read_bytes()).hexdigest()
     duplex_patch_sha256 = hashlib.sha256(duplex_patch_path.read_bytes()).hexdigest()
     require(
-        backlog_patch_sha256 == "5238eb9c961f03201de5de19e7c59cf1f3abd270c97588e2d3dca911ea65b7ad",
+        backlog_patch_sha256 == "72bc6bc3d338a78c9e1ebe89692f12c544e92ad2862be58b8aca942702a981a1",
         f"unexpected restore-backlog patch checksum: {backlog_patch_sha256}",
     )
     require(
-        duplex_patch_sha256 == "f2c7baf517f7f7076a12e5703e36ab089b918b6aff72b544ddf1a59c46db897d",
+        duplex_patch_sha256 == "93a2edf137e6214410b436ecbed1ae0d6cf3056e2bb6325910d52e50e3df28a2",
         f"unexpected duplex-refill patch checksum: {duplex_patch_sha256}",
     )
 
@@ -59,6 +61,14 @@ def main() -> int:
     require('make -j"${BUILD_JOBS}"' in installer, "installer does not use BUILD_JOBS")
     require('make -j"$(nproc)"' not in installer, "unbounded nproc build remains")
 
+    require(
+        "FROM=jalib::JServerSocket restoreSocket(sockAddr, 0);" in backlog_patch,
+        "backlog patch FROM directive missing for the primary IPv4 listener",
+    )
+    require(
+        "TO=jalib::JServerSocket restoreSocket(sockAddr, 0, 1024);" in backlog_patch,
+        "backlog patch TO directive missing for the primary IPv4 listener",
+    )
     for fd_name in ("ip6fd", "udsfd", "udsseqfd"):
         require(
             f"FROM=_real_listen({fd_name}, 32)" in backlog_patch,
@@ -78,6 +88,10 @@ def main() -> int:
         "configuration backlog default is missing",
     )
     require("DMTCP restore-listener backlog" in readme, "README backlog documentation missing")
+    require(
+        'DMTCP_RESTORE_LISTENER_PATHS="4"' in installer,
+        "environment helper does not report four patched listener paths",
+    )
 
     require(
         'WORKING_DMTCP_BACKLOG_PATCH_SHA256=' in installer,
@@ -103,22 +117,43 @@ def main() -> int:
         'stream-refill payload send failed' in duplex_patch,
         "duplex-refill patch lacks its state-machine marker",
     )
+    require(
+        'stream-refill receive buffer is too small' in duplex_patch,
+        "duplex-refill patch lacks receive-capacity verification",
+    )
+    require('SO_RCVBUFFORCE' in duplex_patch, "duplex-refill patch lacks privileged receive-buffer fallback")
+    require(
+        'failed to restore stream-refill receive buffer size' in duplex_patch,
+        "duplex-refill patch does not restore the original receive-buffer setting",
+    )
     require('+#include <poll.h>' in duplex_patch, "duplex-refill patch lacks poll support")
     require(
         'replacements = (' not in installer,
         "old embedded backlog replacement table remains in installer",
     )
     require(
-        'WORKING_DMTCP_KERNELBUFFERDRAINER_SHA256=' in config,
-        "configuration duplex-refill checksum is missing",
+        'WORKING_DMTCP_DUPLEX_PATCH_SHA256=' in config,
+        "configuration duplex-refill patch checksum is missing",
     )
     require(
-        "DMTCP_DUPLEX_REFILL_PATCH_ACTIVE=1" in config,
-        "runtime duplex-refill plugin verification is missing",
+        "DMTCP_REFILL_RECEIVE_CAPACITY_PATCH_ACTIVE=1" in config,
+        "runtime receive-capacity plugin verification is missing",
     )
     require(
-        "nonblocking duplex state machine" in readme,
-        "README duplex-refill documentation missing",
+        "failed to restore stream-refill receive buffer size" in config,
+        "runtime verification lacks a release-stable receive-capacity marker",
+    )
+    require(
+        "temporarily expanded stream-refill receive buffer' \"${dmtcp_ipc_plugin}\"" not in config,
+        "runtime verification still depends on a JTRACE-only marker",
+    )
+    require(
+        "JTRACE text may be omitted by optimized builds" in installer,
+        "installer does not document release-stable plugin verification",
+    )
+    require(
+        "receive-capacity-aware nonblocking duplex state machine" in readme,
+        "README receive-capacity duplex-refill documentation missing",
     )
 
     require(
@@ -131,11 +166,86 @@ def main() -> int:
         "restore retry grace default is missing",
     )
     require("cleanup_failed_restore_attempt" in run_one, "failed-attempt cleanup is missing")
+    require(
+        'local apply_retry_grace="${3:-true}"' in run_one,
+        "failed-attempt cleanup cannot distinguish a real retry from final cleanup",
+    )
+    require(
+        'APPLY_RETRY_GRACE="false"' in run_one,
+        "final failed restore attempt still applies the retry-only grace",
+    )
+    require(
+        "skipped after the final failed attempt" in readme,
+        "README does not document final-attempt grace behavior",
+    )
     require("restore_attempts_summary.tsv" in run_one, "restore-attempt summary is missing")
     require("successful_restore_attempt_seconds.txt" in run_one, "successful-attempt metric is missing")
     require("restore_attempt_count" in summarizer, "summarizer does not expose restore-attempt counts")
     require("restore_retry_count" in summarizer, "summarizer does not expose restore-retry counts")
     require("Automatic restore retries" in readme, "README restore-retry documentation missing")
+    require(
+        'RESTORE_RESERVE_ORIGINAL_TCP_PORTS="${RESTORE_RESERVE_ORIGINAL_TCP_PORTS:-true}"'
+        in config,
+        "restore-port reservation default is missing",
+    )
+    require("reserve_restore_ports" in run_one, "restore-port reservation setup is missing")
+    require("release_restore_ports" in run_one, "restore-port reservation release is missing")
+    require("flock -w" in run_one, "restore-port reservation is not serialized")
+    require("ip_local_reserved_ports" in reservation, "reservation helper targets no sysctl")
+    require(
+        "captured_ipv4_tcp_listener_ports" in reservation,
+        "reservation helper does not extract captured listeners",
+    )
+    require(
+        "Restore-port collision protection" in readme,
+        "README restore-port protection documentation missing",
+    )
+
+    require(
+        'RESTORE_TUNE_TCP_RECEIVE_WINDOW="${RESTORE_TUNE_TCP_RECEIVE_WINDOW:-true}"'
+        in config,
+        "restore TCP receive-window tuning default is missing",
+    )
+    require(
+        'RESTORE_NET_CORE_RMEM_MAX="${RESTORE_NET_CORE_RMEM_MAX:-16777216}"'
+        in config,
+        "restore rmem_max floor is missing",
+    )
+    require(
+        'RESTORE_NET_IPV4_TCP_RMEM="${RESTORE_NET_IPV4_TCP_RMEM:-4096 4194304 16777216}"'
+        in config,
+        "restore tcp_rmem floor is missing",
+    )
+    require(
+        "apply_restore_tcp_receive_window" in run_one,
+        "restore TCP receive-window setup is missing",
+    )
+    require(
+        "release_restore_tcp_receive_window" in run_one,
+        "restore TCP receive-window release is missing",
+    )
+    restore_phase = run_one.index('RESTORE_START_NS="$(now_ns)"')
+    require(
+        run_one.index("apply_restore_tcp_receive_window", restore_phase)
+        < run_one.index("reserve_restore_ports", restore_phase),
+        "TCP receive-window tuning is not applied before restore port reservation",
+    )
+    require(
+        "net.core.rmem_max" in receive_window and "net.ipv4.tcp_rmem" in receive_window,
+        "receive-window helper does not manage both required sysctls",
+    )
+    require(
+        "Never lower host settings" in receive_window,
+        "receive-window helper does not preserve higher host settings",
+    )
+    require(
+        "restore_original_values" in receive_window,
+        "receive-window helper lacks transactional rollback/restoration",
+    )
+    require(
+        "Restore-scoped TCP receive-window tuning" in readme,
+        "README receive-window transaction documentation missing",
+    )
 
     final_wait = run_one.index('wait "${RESTORED_PID}"', run_one.index("monitor_background_process"))
     final_refresh = run_one.index(
@@ -169,7 +279,9 @@ def main() -> int:
         "socket_cleanup_sleep_seconds.txt",
         "total_wall_seconds.txt",
     )
-    production_text = "\n".join((run_one, summarizer, cleanup, readme))
+    production_text = "\n".join(
+        (run_one, summarizer, cleanup, reservation, receive_window, readme)
+    )
     for artifact in forbidden_artifacts:
         require(artifact not in production_text, f"obsolete artifact remains: {artifact}")
 
@@ -182,7 +294,7 @@ def main() -> int:
     require("replace|skip|error" not in run_one + run_all, "old skip policy remains")
     require(not (REPO_ROOT / ".idea").exists(), ".idea directory is present")
 
-    print("[OK] repository contract: versioned DMTCP patches, final logs, bounded builds, cleanup, retries, markers, resume, and current artifacts")
+    print("[OK] repository contract: DMTCP patches, transactional restore sysctls, final logs, cleanup, retries, markers, resume, and current artifacts")
     return 0
 
 

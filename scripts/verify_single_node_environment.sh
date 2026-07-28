@@ -33,6 +33,21 @@ import signal
 raise SystemExit(0 if hasattr(os, "pidfd_open") and hasattr(signal, "pidfd_send_signal") else 1)
 PY
 
+command -v flock >/dev/null 2>&1 \
+  || fail "flock is required for serialized restore-port reservation."
+
+case "${RESTORE_RESERVE_ORIGINAL_TCP_PORTS}" in
+  true|false) ;;
+  *) fail "RESTORE_RESERVE_ORIGINAL_TCP_PORTS must be true or false." ;;
+esac
+
+if [ "${RESTORE_RESERVE_ORIGINAL_TCP_PORTS}" = "true" ]; then
+  [ -r "${RESTORE_IP_LOCAL_RESERVED_PORTS_PATH}" ] \
+    || fail "cannot read ${RESTORE_IP_LOCAL_RESERVED_PORTS_PATH}."
+  [ -w "${RESTORE_IP_LOCAL_RESERVED_PORTS_PATH}" ] \
+    || fail "cannot write ${RESTORE_IP_LOCAL_RESERVED_PORTS_PATH}; sufficient privilege is required for collision-safe restore-port reservation."
+fi
+
 read -r EPHEMERAL_PORT_MIN EPHEMERAL_PORT_MAX \
   < /proc/sys/net/ipv4/ip_local_port_range
 
@@ -49,8 +64,9 @@ echo "Single-node DMTCP/MPICH environment: VERIFIED"
 echo "============================================================"
 echo "DMTCP commit:          ${DMTCP_COMMIT}"
 echo "DMTCP executable:      $(readlink -f "$(command -v dmtcp_launch)")"
-echo "DMTCP restore backlog: ${DMTCP_RESTORE_LISTEN_BACKLOG}"
+echo "DMTCP restore backlog: ${DMTCP_RESTORE_LISTEN_BACKLOG} across ${DMTCP_RESTORE_LISTENER_PATHS} listener paths"
 echo "DMTCP duplex refill:   ${DMTCP_DUPLEX_REFILL_PATCH_ACTIVE}"
+echo "DMTCP receive capacity:${DMTCP_REFILL_RECEIVE_CAPACITY_PATCH_ACTIVE}"
 echo "DMTCP IPC plugin:      ${DMTCP_IPC_PLUGIN_PATH}"
 echo "DMTCP IPC SHA256:      ${DMTCP_IPC_PLUGIN_SHA256}"
 echo "Kernel somaxconn:      $(cat /proc/sys/net/core/somaxconn)"
@@ -69,6 +85,9 @@ echo "Pre-restore cleanup:   timeout=${PRE_RESTORE_CLEANUP_TIMEOUT_SECONDS}s, po
 echo "Cleanup escalation:    TERM after ${PRE_RESTORE_FORCE_KILL_AFTER_SECONDS}s, KILL ${PRE_RESTORE_FORCE_KILL_GRACE_SECONDS}s later"
 echo "Final verified grace:  ${PRE_RESTORE_FINAL_GRACE_SECONDS}s"
 echo "Bind-failure abort:    ${RESTORE_BIND_FAILURE_ABORT_SECONDS}s persistent"
+echo "Reserve restore ports: ${RESTORE_RESERVE_ORIGINAL_TCP_PORTS}"
+echo "Reserved-ports sysctl: ${RESTORE_IP_LOCAL_RESERVED_PORTS_PATH}"
+echo "Reservation lock:      ${RESTORE_PORT_RESERVATION_LOCK_FILE} (${RESTORE_PORT_RESERVATION_LOCK_TIMEOUT_SECONDS}s timeout)"
 echo "PID-safe escalation:   Linux pidfd verified"
 echo "Ephemeral port range:  ${EPHEMERAL_PORT_MIN}-${EPHEMERAL_PORT_MAX}"
 echo "Kernel:                $(uname -srvo)"

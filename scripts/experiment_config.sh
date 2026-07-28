@@ -58,7 +58,8 @@ NPB_CLASS="${NPB_CLASS:-D}"
 # Exact single-node stack preserved from the previously working package.
 WORKING_DMTCP_COMMIT="${WORKING_DMTCP_COMMIT:-6896e12276a9fe449edb0cf206203ce01b19efe6}"
 WORKING_DMTCP_RESTORE_LISTEN_BACKLOG="${WORKING_DMTCP_RESTORE_LISTEN_BACKLOG:-1024}"
-WORKING_DMTCP_KERNELBUFFERDRAINER_SHA256="${WORKING_DMTCP_KERNELBUFFERDRAINER_SHA256:-c5d7b960220762b6a291f5a1aef5989786ed47c00318dcc78a8fb2b6db9cf04c}"
+WORKING_DMTCP_RESTORE_LISTENER_PATHS="${WORKING_DMTCP_RESTORE_LISTENER_PATHS:-4}"
+WORKING_DMTCP_DUPLEX_PATCH_SHA256="${WORKING_DMTCP_DUPLEX_PATCH_SHA256:-93a2edf137e6214410b436ecbed1ae0d6cf3056e2bb6325910d52e50e3df28a2}"
 WORKING_MPICH_VERSION="${WORKING_MPICH_VERSION:-5.0.0}"
 WORKING_MPICH_DEVICE="${WORKING_MPICH_DEVICE:-ch3:nemesis}"
 
@@ -129,7 +130,10 @@ CHECKPOINT_CLEANUP_MODE="${CHECKPOINT_CLEANUP_MODE:-delete-checkpoints}"
 #   4. Capture the exact original process tree and its socket endpoints.
 #   5. Kill the original DMTCP computation and allow its coordinator to exit.
 #   6. Adaptively wait for the captured processes and endpoints to become clear.
-#   7. Execute the generated restart script without extra arguments.
+#   7. Transactionally raise restore-time TCP receive-window floors.
+#   8. Reserve captured original TCP listener ports against ephemeral reuse.
+#   9. Execute the generated restart script without extra arguments.
+#  10. Restore the exact previous kernel values after clients reach RUNNING.
 #
 # This value is intentionally fixed for the validated single-node workflow.
 COORDINATOR_LIFECYCLE="fresh"
@@ -168,6 +172,29 @@ RESTORE_MAX_ATTEMPTS="${RESTORE_MAX_ATTEMPTS:-3}"
 # endpoints are cleaned with adaptive_pre_restore_cleanup.py. This grace is
 # applied only after all captured endpoints are verified reusable.
 RESTORE_RETRY_FINAL_GRACE_SECONDS="${RESTORE_RETRY_FINAL_GRACE_SECONDS:-10}"
+
+# Prevent DMTCP's temporary IPv4 restore listener (bind(port=0)) from being
+# assigned a captured original application listener port. The runner holds a
+# suite-wide lock, adds captured IPv4 TCP LISTEN ports to
+# net.ipv4.ip_local_reserved_ports for the complete restore-attempt sequence,
+# and restores the previous value afterward.
+RESTORE_RESERVE_ORIGINAL_TCP_PORTS="${RESTORE_RESERVE_ORIGINAL_TCP_PORTS:-true}"
+RESTORE_PORT_RESERVATION_LOCK_FILE="${RESTORE_PORT_RESERVATION_LOCK_FILE:-/run/lock/npb_dmtcp_restore_ports.lock}"
+RESTORE_PORT_RESERVATION_LOCK_TIMEOUT_SECONDS="${RESTORE_PORT_RESERVATION_LOCK_TIMEOUT_SECONDS:-30}"
+RESTORE_IP_LOCAL_RESERVED_PORTS_PATH="${RESTORE_IP_LOCAL_RESERVED_PORTS_PATH:-/proc/sys/net/ipv4/ip_local_reserved_ports}"
+
+# Some checkpoint states contain more saved TCP payload than the kernel's
+# default receive window can accept during DMTCP stream refill. Immediately
+# before restore, the runner transactionally raises these values, keeps them
+# active through every attempt, and restores the exact previous values after
+# all clients reach RUNNING or on any failure/signal cleanup path.
+RESTORE_TUNE_TCP_RECEIVE_WINDOW="${RESTORE_TUNE_TCP_RECEIVE_WINDOW:-true}"
+RESTORE_TCP_RECEIVE_WINDOW_LOCK_FILE="${RESTORE_TCP_RECEIVE_WINDOW_LOCK_FILE:-/run/lock/npb_dmtcp_restore_tcp_receive_window.lock}"
+RESTORE_TCP_RECEIVE_WINDOW_LOCK_TIMEOUT_SECONDS="${RESTORE_TCP_RECEIVE_WINDOW_LOCK_TIMEOUT_SECONDS:-30}"
+RESTORE_NET_CORE_RMEM_MAX="${RESTORE_NET_CORE_RMEM_MAX:-16777216}"
+RESTORE_NET_IPV4_TCP_RMEM="${RESTORE_NET_IPV4_TCP_RMEM:-4096 4194304 16777216}"
+RESTORE_NET_CORE_RMEM_MAX_PATH="${RESTORE_NET_CORE_RMEM_MAX_PATH:-/proc/sys/net/core/rmem_max}"
+RESTORE_NET_IPV4_TCP_RMEM_PATH="${RESTORE_NET_IPV4_TCP_RMEM_PATH:-/proc/sys/net/ipv4/tcp_rmem}"
 
 POST_CHECKPOINT_STABILIZATION_SECONDS="${POST_CHECKPOINT_STABILIZATION_SECONDS:-2}"
 
@@ -241,17 +268,23 @@ verify_single_node_stack() {
   fi
 
   if [ "${DMTCP_RESTORE_BACKLOG_PATCH:-}" != "1" ] || \
-     [ "${DMTCP_RESTORE_LISTEN_BACKLOG:-}" != "${WORKING_DMTCP_RESTORE_LISTEN_BACKLOG}" ]; then
+     [ "${DMTCP_RESTORE_LISTEN_BACKLOG:-}" != "${WORKING_DMTCP_RESTORE_LISTEN_BACKLOG}" ] || \
+     [ "${DMTCP_RESTORE_LISTENER_PATHS:-}" != "${WORKING_DMTCP_RESTORE_LISTENER_PATHS}" ]; then
     echo "ERROR: The active DMTCP installation does not contain the" >&2
     echo "required restore-listener backlog patch." >&2
     echo "  Required backlog: ${WORKING_DMTCP_RESTORE_LISTEN_BACKLOG}" >&2
     echo "  Active backlog:   ${DMTCP_RESTORE_LISTEN_BACKLOG:-unset}" >&2
+    echo "  Required listener paths: ${WORKING_DMTCP_RESTORE_LISTENER_PATHS}" >&2
+    echo "  Active listener paths:   ${DMTCP_RESTORE_LISTENER_PATHS:-unset}" >&2
     echo "Rebuild DMTCP with install_dmtcp_mpich_env.sh." >&2
     return 1
   fi
 
   if ! grep -Fxq \
       "dmtcp_restore_listen_backlog=${WORKING_DMTCP_RESTORE_LISTEN_BACKLOG}" \
+      "${DMTCP_MPICH_MANIFEST:-/nonexistent}" 2>/dev/null || \
+     ! grep -Fxq \
+      "dmtcp_restore_listener_paths=${WORKING_DMTCP_RESTORE_LISTENER_PATHS}" \
       "${DMTCP_MPICH_MANIFEST:-/nonexistent}" 2>/dev/null; then
     echo "ERROR: The build manifest does not verify the required" >&2
     echo "DMTCP restore-listener backlog patch." >&2
@@ -270,28 +303,43 @@ verify_single_node_stack() {
     return 1
   fi
 
+  # Verify only release-stable assertion strings.  JTRACE messages may be
+  # compiled out of an optimized DMTCP build and must not be used as runtime
+  # proof that the patch is absent.
   if ! grep -aFq 'stream-refill header receive failed' "${dmtcp_ipc_plugin}" || \
-     ! grep -aFq 'stream-refill payload send failed' "${dmtcp_ipc_plugin}"; then
+     ! grep -aFq 'stream-refill payload send failed' "${dmtcp_ipc_plugin}" || \
+     ! grep -aFq 'stream-refill receive buffer is too small' "${dmtcp_ipc_plugin}" || \
+     ! grep -aFq 'failed to restore stream-refill receive buffer size' "${dmtcp_ipc_plugin}"; then
     echo "ERROR: The active DMTCP IPC plugin does not contain the" >&2
-    echo "nonblocking duplex stream-refill fix." >&2
+    echo "receive-capacity-aware duplex stream-refill fix." >&2
     echo "  Plugin: ${dmtcp_ipc_plugin}" >&2
     echo "Rebuild DMTCP with install_dmtcp_mpich_env.sh." >&2
     return 1
   fi
 
-  if [ -n "${DMTCP_DUPLEX_REFILL_PATCH:-}" ] && \
-     [ "${DMTCP_DUPLEX_REFILL_PATCH}" != "1" ]; then
-    echo "ERROR: The environment helper reports that the DMTCP duplex" >&2
-    echo "stream-refill patch is inactive." >&2
+  if [ "${DMTCP_DUPLEX_REFILL_PATCH:-}" != "1" ] || \
+     [ "${DMTCP_REFILL_RECEIVE_CAPACITY_PATCH:-}" != "1" ]; then
+    echo "ERROR: The environment helper reports that the DMTCP" >&2
+    echo "receive-capacity-aware duplex stream-refill patch is inactive." >&2
     return 1
   fi
 
-  if [ -n "${DMTCP_KERNELBUFFERDRAINER_SHA256:-}" ] && \
-     [ "${DMTCP_KERNELBUFFERDRAINER_SHA256}" != \
-       "${WORKING_DMTCP_KERNELBUFFERDRAINER_SHA256}" ]; then
-    echo "ERROR: Unexpected patched kernelbufferdrainer.cpp checksum." >&2
-    echo "  Required: ${WORKING_DMTCP_KERNELBUFFERDRAINER_SHA256}" >&2
-    echo "  Active:   ${DMTCP_KERNELBUFFERDRAINER_SHA256}" >&2
+  if [ "${DMTCP_DUPLEX_PATCH_FILE_SHA256:-}" != \
+       "${WORKING_DMTCP_DUPLEX_PATCH_SHA256}" ]; then
+    echo "ERROR: Unexpected DMTCP stream-refill patch checksum." >&2
+    echo "  Required: ${WORKING_DMTCP_DUPLEX_PATCH_SHA256}" >&2
+    echo "  Active:   ${DMTCP_DUPLEX_PATCH_FILE_SHA256:-unset}" >&2
+    return 1
+  fi
+
+  if ! grep -Fxq \
+      "dmtcp_duplex_patch_file_sha256=${WORKING_DMTCP_DUPLEX_PATCH_SHA256}" \
+      "${DMTCP_MPICH_MANIFEST:-/nonexistent}" 2>/dev/null || \
+     ! grep -Fxq \
+      "dmtcp_refill_receive_capacity_patch=1" \
+      "${DMTCP_MPICH_MANIFEST:-/nonexistent}" 2>/dev/null; then
+    echo "ERROR: The build manifest does not verify the active" >&2
+    echo "receive-capacity-aware stream-refill patch." >&2
     return 1
   fi
 
@@ -306,9 +354,11 @@ verify_single_node_stack() {
   fi
 
   DMTCP_DUPLEX_REFILL_PATCH_ACTIVE=1
+  DMTCP_REFILL_RECEIVE_CAPACITY_PATCH_ACTIVE=1
   DMTCP_IPC_PLUGIN_PATH="${dmtcp_ipc_plugin}"
   DMTCP_IPC_PLUGIN_SHA256="${dmtcp_ipc_plugin_sha256}"
   export DMTCP_DUPLEX_REFILL_PATCH_ACTIVE
+  export DMTCP_REFILL_RECEIVE_CAPACITY_PATCH_ACTIVE
   export DMTCP_IPC_PLUGIN_PATH
   export DMTCP_IPC_PLUGIN_SHA256
 

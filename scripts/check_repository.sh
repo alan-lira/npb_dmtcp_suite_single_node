@@ -42,8 +42,20 @@ if (
     "${RESTORE_BIND_FAILURE_ABORT_SECONDS}" \
     "${RESTORE_MAX_ATTEMPTS}" \
     "${RESTORE_RETRY_FINAL_GRACE_SECONDS}" \
+    "${RESTORE_RESERVE_ORIGINAL_TCP_PORTS}" \
+    "${RESTORE_PORT_RESERVATION_LOCK_FILE}" \
+    "${RESTORE_PORT_RESERVATION_LOCK_TIMEOUT_SECONDS}" \
+    "${RESTORE_IP_LOCAL_RESERVED_PORTS_PATH}" \
+    "${RESTORE_TUNE_TCP_RECEIVE_WINDOW}" \
+    "${RESTORE_TCP_RECEIVE_WINDOW_LOCK_FILE}" \
+    "${RESTORE_TCP_RECEIVE_WINDOW_LOCK_TIMEOUT_SECONDS}" \
+    "${RESTORE_NET_CORE_RMEM_MAX}" \
+    "${RESTORE_NET_IPV4_TCP_RMEM}" \
+    "${RESTORE_NET_CORE_RMEM_MAX_PATH}" \
+    "${RESTORE_NET_IPV4_TCP_RMEM_PATH}" \
     "${WORKING_DMTCP_RESTORE_LISTEN_BACKLOG}" \
-    "${WORKING_DMTCP_KERNELBUFFERDRAINER_SHA256}"
+    "${WORKING_DMTCP_RESTORE_LISTENER_PATHS}" \
+    "${WORKING_DMTCP_DUPLEX_PATCH_SHA256}"
 ); then
   printf '[OK] Runtime load: scripts/experiment_config.sh\n'
 else
@@ -121,6 +133,17 @@ required_settings=(
   RESTORE_BIND_FAILURE_ABORT_SECONDS
   RESTORE_MAX_ATTEMPTS
   RESTORE_RETRY_FINAL_GRACE_SECONDS
+  RESTORE_RESERVE_ORIGINAL_TCP_PORTS
+  RESTORE_PORT_RESERVATION_LOCK_FILE
+  RESTORE_PORT_RESERVATION_LOCK_TIMEOUT_SECONDS
+  RESTORE_IP_LOCAL_RESERVED_PORTS_PATH
+  RESTORE_TUNE_TCP_RECEIVE_WINDOW
+  RESTORE_TCP_RECEIVE_WINDOW_LOCK_FILE
+  RESTORE_TCP_RECEIVE_WINDOW_LOCK_TIMEOUT_SECONDS
+  RESTORE_NET_CORE_RMEM_MAX
+  RESTORE_NET_IPV4_TCP_RMEM
+  RESTORE_NET_CORE_RMEM_MAX_PATH
+  RESTORE_NET_IPV4_TCP_RMEM_PATH
 )
 for setting in "${required_settings[@]}"; do
   missing=0
@@ -168,10 +191,14 @@ DMTCP_PATCH_DIR="${REPO_ROOT}/patches/dmtcp-6896e12276a9fe449edb0cf206203ce01b19
 BACKLOG_PATCH="${DMTCP_PATCH_DIR}/connectionrewirer-backlog-1024.exact.patch"
 DUPLEX_PATCH="${DMTCP_PATCH_DIR}/kernelbufferdrainer-duplex-refill.patch"
 OLD_DUPLEX_OVERRIDE="${DMTCP_PATCH_DIR}/kernelbufferdrainer.cpp"
-EXPECTED_BACKLOG_PATCH_SHA256="5238eb9c961f03201de5de19e7c59cf1f3abd270c97588e2d3dca911ea65b7ad"
-EXPECTED_DUPLEX_PATCH_SHA256="f2c7baf517f7f7076a12e5703e36ab089b918b6aff72b544ddf1a59c46db897d"
+EXPECTED_BACKLOG_PATCH_SHA256="72bc6bc3d338a78c9e1ebe89692f12c544e92ad2862be58b8aca942702a981a1"
+EXPECTED_DUPLEX_PATCH_SHA256="93a2edf137e6214410b436ecbed1ae0d6cf3056e2bb6325910d52e50e3df28a2"
 
 backlog_pairs_ok=1
+grep -Fxq 'FROM=jalib::JServerSocket restoreSocket(sockAddr, 0);' "${BACKLOG_PATCH}" 2>/dev/null \
+  || backlog_pairs_ok=0
+grep -Fxq 'TO=jalib::JServerSocket restoreSocket(sockAddr, 0, 1024);' "${BACKLOG_PATCH}" 2>/dev/null \
+  || backlog_pairs_ok=0
 for fd_name in ip6fd udsfd udsseqfd; do
   grep -Fxq "FROM=_real_listen(${fd_name}, 32)" "${BACKLOG_PATCH}" 2>/dev/null \
     || backlog_pairs_ok=0
@@ -195,11 +222,39 @@ if [ -f "${BACKLOG_PATCH}" ] && \
      "${SCRIPT_DIR}/install_dmtcp_mpich_env.sh" && \
    grep -Fq '+#include <poll.h>' "${DUPLEX_PATCH}" && \
    grep -Fq 'stream-refill payload send failed' "${DUPLEX_PATCH}" && \
-   grep -Fq 'DMTCP_DUPLEX_REFILL_PATCH_ACTIVE=1' \
+   grep -Fq 'stream-refill receive buffer is too small' "${DUPLEX_PATCH}" && \
+   grep -Fq 'SO_RCVBUFFORCE' "${DUPLEX_PATCH}" && \
+   grep -Fq 'DMTCP_REFILL_RECEIVE_CAPACITY_PATCH_ACTIVE=1' \
      "${SCRIPT_DIR}/experiment_config.sh"; then
   printf '[OK] Version-specific DMTCP patch bundle integration\n'
 else
   report_error 'version-specific DMTCP patch bundle integration is incomplete'
+fi
+
+if [ -x "${SCRIPT_DIR}/restore_port_reservation.py" ] && \
+   grep -Fq 'reserve_restore_ports' "${SCRIPT_DIR}/run_one.sh" && \
+   grep -Fq 'release_restore_ports' "${SCRIPT_DIR}/run_one.sh" && \
+   grep -Fq 'ip_local_reserved_ports' "${SCRIPT_DIR}/restore_port_reservation.py" && \
+   grep -Fq 'flock -w "${RESTORE_PORT_RESERVATION_LOCK_TIMEOUT_SECONDS}"' \
+     "${SCRIPT_DIR}/run_one.sh" && \
+   grep -Fq 'Restore-port collision protection' "${REPO_ROOT}/README.md"; then
+  printf '[OK] Transactional restore-port reservation integration\n'
+else
+  report_error 'transactional restore-port reservation integration is incomplete'
+fi
+
+
+if [ -x "${SCRIPT_DIR}/restore_tcp_receive_window.py" ] && \
+   grep -Fq 'apply_restore_tcp_receive_window' "${SCRIPT_DIR}/run_one.sh" && \
+   grep -Fq 'release_restore_tcp_receive_window' "${SCRIPT_DIR}/run_one.sh" && \
+   grep -Fq 'net.core.rmem_max' "${SCRIPT_DIR}/restore_tcp_receive_window.py" && \
+   grep -Fq 'net.ipv4.tcp_rmem' "${SCRIPT_DIR}/restore_tcp_receive_window.py" && \
+   grep -Fq 'flock -w "${RESTORE_TCP_RECEIVE_WINDOW_LOCK_TIMEOUT_SECONDS}"' \
+     "${SCRIPT_DIR}/run_one.sh" && \
+   grep -Fq 'Restore-scoped TCP receive-window tuning' "${REPO_ROOT}/README.md"; then
+  printf '[OK] Transactional restore TCP receive-window integration\n'
+else
+  report_error 'transactional restore TCP receive-window integration is incomplete'
 fi
 
 if grep -Fq 'copy_restore_attempt_to_canonical_logs "${SUCCESSFUL_ATTEMPT_DIR}"' \
@@ -241,17 +296,26 @@ else
 fi
 
 for test_script in \
-  test_adaptive_pre_restore_cleanup.py \
+  test_summarize_results.py \
   test_repository_contract.py \
-  test_restore_retry.py \
-  test_run_resume.py \
-  test_summarize_results.py; do
-  if "${TEST_DIR}/${test_script}"; then
+  test_dmtcp_patch_application.py \
+  test_refill_receive_capacity.py \
+  test_restore_port_reservation.py \
+  test_restore_tcp_receive_window.py \
+  test_adaptive_pre_restore_cleanup.py; do
+  printf '[RUN] Test: tests/%s\n' "${test_script}"
+  test_log="$(mktemp)"
+  if "${TEST_DIR}/${test_script}" > "${test_log}" 2>&1; then
+    cat "${test_log}"
     printf '[OK] Test passed: tests/%s\n' "${test_script}"
   else
+    cat "${test_log}" >&2
     report_error "test failed: tests/${test_script}"
   fi
+  rm -f -- "${test_log}"
 done
+
+printf '[INFO] Environment-sensitive integration tests are run separately: tests/test_restore_retry.py and tests/test_run_resume.py\n'
 
 if [ -d "${REPO_ROOT}/.idea" ]; then
   report_error '.idea/ should not be included in the delivered repository'

@@ -173,6 +173,11 @@ def main() -> int:
             encoding="utf-8",
         )
 
+        fake_rmem_max = temp / "net_core_rmem_max"
+        fake_tcp_rmem = temp / "net_ipv4_tcp_rmem"
+        fake_rmem_max.write_text("212992\n", encoding="utf-8")
+        fake_tcp_rmem.write_text("4096 131072 6291456\n", encoding="utf-8")
+
         env = os.environ.copy()
         env.update(
             {
@@ -187,6 +192,14 @@ def main() -> int:
                 "RESTORE_MAX_ATTEMPTS": "2",
                 "RESTORE_RETRY_FINAL_GRACE_SECONDS": "0",
                 "RESTORE_BIND_FAILURE_ABORT_SECONDS": "1",
+                "RESTORE_RESERVE_ORIGINAL_TCP_PORTS": "false",
+                "RESTORE_TUNE_TCP_RECEIVE_WINDOW": "true",
+                "RESTORE_TCP_RECEIVE_WINDOW_LOCK_FILE": str(temp / "receive-window.lock"),
+                "RESTORE_TCP_RECEIVE_WINDOW_LOCK_TIMEOUT_SECONDS": "5",
+                "RESTORE_NET_CORE_RMEM_MAX": "16777216",
+                "RESTORE_NET_IPV4_TCP_RMEM": "4096 4194304 16777216",
+                "RESTORE_NET_CORE_RMEM_MAX_PATH": str(fake_rmem_max),
+                "RESTORE_NET_IPV4_TCP_RMEM_PATH": str(fake_tcp_rmem),
                 "PRE_RESTORE_CLEANUP_TIMEOUT_SECONDS": "10",
                 "PRE_RESTORE_CLEANUP_POLL_SECONDS": "0.05",
                 "PRE_RESTORE_FORCE_KILL_AFTER_SECONDS": "0.2",
@@ -246,6 +259,13 @@ def main() -> int:
         for label, path in checks.items():
             if not path.is_file():
                 raise AssertionError(f"missing {label}: {path}")
+
+        if fake_rmem_max.read_text(encoding="utf-8").strip() != "212992":
+            raise AssertionError("retry integration did not restore net.core.rmem_max")
+        if fake_tcp_rmem.read_text(encoding="utf-8").strip() != "4096 131072 6291456":
+            raise AssertionError("retry integration did not restore net.ipv4.tcp_rmem")
+        if (run_dir / "restore_tcp_receive_window_status.txt").read_text(encoding="utf-8").strip() != "RELEASED":
+            raise AssertionError("receive-window transaction was not released")
 
         if checks["attempt 1 failure"].read_text().strip() != "FAILED":
             raise AssertionError("first restore attempt was not recorded as FAILED")
