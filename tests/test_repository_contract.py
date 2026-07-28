@@ -151,8 +151,10 @@ def main() -> int:
         "JTRACE text may be omitted by optimized builds" in installer,
         "installer does not document release-stable plugin verification",
     )
+    readme_normalized = " ".join(readme.split())
     require(
-        "receive-capacity-aware nonblocking duplex state machine" in readme,
+        "receive-capacity-aware nonblocking duplex state machine"
+        in readme_normalized,
         "README receive-capacity duplex-refill documentation missing",
     )
 
