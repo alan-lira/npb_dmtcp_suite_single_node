@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
 from pathlib import Path
 import subprocess
@@ -15,6 +16,47 @@ import tempfile
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 HELPER = REPO_ROOT / "scripts" / "restore_tcp_receive_window.py"
+
+
+def load_helper_module():
+    spec = importlib.util.spec_from_file_location("restore_tcp_receive_window", HELPER)
+    if spec is None or spec.loader is None:
+        raise AssertionError(f"cannot load helper module: {HELPER}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def verify_kernel_whitespace_normalization(root: Path) -> None:
+    """Model procfs rewriting a space-delimited triplet with tabs."""
+
+    helper = load_helper_module()
+    tcp_rmem = root / "kernel_formatted_tcp_rmem"
+    tcp_rmem.write_text("4096\t131072\t6291456\n", encoding="utf-8")
+
+    original_write_value = helper.write_value
+
+    def kernel_formatted_write(path: Path, value: str) -> None:
+        if path == tcp_rmem:
+            original_write_value(path, "\t".join(value.split()))
+        else:
+            original_write_value(path, value)
+
+    helper.write_value = kernel_formatted_write
+    try:
+        helper.verified_write(
+            tcp_rmem,
+            "4096 4194304 16777216",
+            "net.ipv4.tcp_rmem setup",
+            normalize=helper.normalize_tcp_rmem,
+        )
+    finally:
+        helper.write_value = original_write_value
+
+    if helper.normalize_tcp_rmem(tcp_rmem.read_text(encoding="utf-8")) != (
+        "4096 4194304 16777216"
+    ):
+        raise AssertionError("kernel-formatted tcp_rmem was not normalized numerically")
 
 
 def run(*args: str, expect_success: bool = True) -> subprocess.CompletedProcess[str]:
@@ -102,6 +144,22 @@ def main() -> int:
             raise AssertionError("higher host tcp_rmem was lowered")
         release(rmem, tcp_rmem, state)
 
+        # The kernel may return an equivalent tcp_rmem triplet with tabs. This
+        # must not be reported as a concurrent modification during release.
+        case_whitespace = root / "case_whitespace"
+        case_whitespace.mkdir()
+        rmem, tcp_rmem, state = prepare(
+            case_whitespace, "212992", "4096 131072 6291456"
+        )
+        tcp_rmem.write_text("4096\t4194304\t16777216\n", encoding="utf-8")
+        release(rmem, tcp_rmem, state)
+        state_data = json.loads(state.read_text(encoding="utf-8"))
+        if state_data.get("release_concurrent_change_detected"):
+            raise AssertionError("format-only tcp_rmem change was treated as external")
+
+        # Exercise verified_write itself against procfs-style tab formatting.
+        verify_kernel_whitespace_normalization(root)
+
         # External changes are detected, but the explicit contract is to restore
         # the exact values captured before this restore transaction.
         case3 = root / "case3"
@@ -177,7 +235,7 @@ def main() -> int:
         if tcp_rmem.read_text(encoding="utf-8").strip() != "4096 131072 6291456":
             raise AssertionError("invalid transaction modified tcp_rmem")
 
-    print("[OK] restore TCP receive-window tuning applies floors and restores exact prior values")
+    print("[OK] restore TCP receive-window tuning handles kernel whitespace and restores exact prior values")
     return 0
 
 

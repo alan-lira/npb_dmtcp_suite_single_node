@@ -17,7 +17,7 @@ import argparse
 import json
 from pathlib import Path
 import sys
-from typing import Iterable
+from typing import Callable, Iterable
 
 
 FORMAT_VERSION = 1
@@ -68,6 +68,20 @@ def format_tcp_rmem(values: Iterable[int]) -> str:
     return " ".join(str(value) for value in values)
 
 
+def normalize_rmem_max(text: str) -> str:
+    """Return the canonical numeric representation of net.core.rmem_max."""
+
+    return str(parse_positive_integer(text, "net.core.rmem_max value"))
+
+
+def normalize_tcp_rmem(text: str) -> str:
+    """Return a canonical space-delimited net.ipv4.tcp_rmem triplet."""
+
+    return format_tcp_rmem(
+        parse_tcp_rmem(text, "net.ipv4.tcp_rmem value")
+    )
+
+
 def write_optional(path_text: str | None, value: str) -> None:
     if path_text:
         path = Path(path_text)
@@ -82,10 +96,16 @@ def atomic_write_json(path: Path, payload: dict[str, object]) -> None:
     temporary.replace(path)
 
 
-def verified_write(path: Path, value: str, description: str) -> None:
+def verified_write(
+    path: Path,
+    value: str,
+    description: str,
+    *,
+    normalize: Callable[[str], str] = lambda text: text.strip(),
+) -> None:
     write_value(path, value)
     actual = read_value(path)
-    if actual != value:
+    if normalize(actual) != normalize(value):
         raise RuntimeError(
             f"{description} verification failed for {path}: wrote {value!r}, read {actual!r}"
         )
@@ -101,11 +121,21 @@ def restore_original_values(
 
     errors: list[str] = []
     try:
-        verified_write(tcp_rmem_path, original_tcp_rmem, "net.ipv4.tcp_rmem restoration")
+        verified_write(
+            tcp_rmem_path,
+            original_tcp_rmem,
+            "net.ipv4.tcp_rmem restoration",
+            normalize=normalize_tcp_rmem,
+        )
     except RuntimeError as exc:
         errors.append(str(exc))
     try:
-        verified_write(rmem_max_path, original_rmem_max, "net.core.rmem_max restoration")
+        verified_write(
+            rmem_max_path,
+            original_rmem_max,
+            "net.core.rmem_max restoration",
+            normalize=normalize_rmem_max,
+        )
     except RuntimeError as exc:
         errors.append(str(exc))
     return errors
@@ -169,8 +199,18 @@ def prepare(args: argparse.Namespace) -> int:
 
     try:
         # Raise the global ceiling before raising per-TCP defaults.
-        verified_write(rmem_max_path, applied_rmem_max_text, "net.core.rmem_max setup")
-        verified_write(tcp_rmem_path, applied_tcp_rmem_text, "net.ipv4.tcp_rmem setup")
+        verified_write(
+            rmem_max_path,
+            applied_rmem_max_text,
+            "net.core.rmem_max setup",
+            normalize=normalize_rmem_max,
+        )
+        verified_write(
+            tcp_rmem_path,
+            applied_tcp_rmem_text,
+            "net.ipv4.tcp_rmem setup",
+            normalize=normalize_tcp_rmem,
+        )
     except RuntimeError as prepare_error:
         rollback_errors = restore_original_values(
             rmem_max_path,
@@ -242,8 +282,10 @@ def release(args: argparse.Namespace) -> int:
     state["release_observed_rmem_max"] = current_rmem_max
     state["release_observed_tcp_rmem"] = current_tcp_rmem
     state["release_concurrent_change_detected"] = bool(
-        current_rmem_max != state.get("applied_rmem_max")
-        or current_tcp_rmem != state.get("applied_tcp_rmem")
+        normalize_rmem_max(current_rmem_max)
+        != normalize_rmem_max(str(state.get("applied_rmem_max")))
+        or normalize_tcp_rmem(current_tcp_rmem)
+        != normalize_tcp_rmem(str(state.get("applied_tcp_rmem")))
     )
 
     errors = restore_original_values(

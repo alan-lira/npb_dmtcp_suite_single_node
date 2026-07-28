@@ -8,8 +8,8 @@ The validated software profile is:
 - DMTCP commit `6896e12276a9fe449edb0cf206203ce01b19efe6`;
 - DMTCP restore-listener backlog patched from `32` to `1024` for the primary
   IPv4 `JServerSocket`, IPv6, Unix-stream, and Unix-seqpacket restore sockets;
-- DMTCP stream-buffer refill replaced with a receive-capacity-aware
-  nonblocking duplex state machine. It prevents symmetric write/write refill
+- DMTCP stream-buffer refill replaced with a receive-capacity-aware nonblocking duplex state machine.
+  It prevents symmetric write/write refill
   deadlocks and temporarily enlarges reconstructed receive buffers when saved
   application data exceeds the kernel default;
 - Linux `net.core.somaxconn` verified at `1024` or greater;
