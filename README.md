@@ -86,6 +86,7 @@ coordinator during restart.
 .gitignore
 LICENSE
 README.md
+requirements-test.txt
 patches/
   dmtcp-6896e12276a9fe449edb0cf206203ce01b19efe6/
     README.md
@@ -102,7 +103,9 @@ scripts/
   restore_port_reservation.py
   restore_tcp_receive_window.py
   run_all.sh
+  run_repository_test.sh
   run_one.sh
+  setup_python_test_env.sh
   summarize_results.py
   verify_single_node_environment.sh
 tests/
@@ -124,14 +127,18 @@ output/                         # generated; ignored by Git
 
 ## 1. Check the repository
 
-Ensure the repository scripts and tests are executable before running the
-checks:
+The repository tests run inside an isolated Python environment at
+`<repository>/.test-env` by default. The environment contains its own `pip` and
+installs `pytest` from `requirements-test.txt`; it does not depend on a
+system-wide pytest installation.
+
+Create or refresh the environment explicitly with:
 
 ```bash
-chmod +x scripts/*.sh scripts/*.py tests/*.py
+./scripts/setup_python_test_env.sh
 ```
 
-From the repository root:
+The checker also creates or refreshes it automatically:
 
 ```bash
 ./scripts/check_repository.sh
@@ -140,14 +147,27 @@ From the repository root:
 The checker validates Bash and Python syntax, executable permissions, unwanted
 IDE/cache artifacts, the version-specific DMTCP patch assets and checksums,
 README/repository consistency, current output-artifact names, configuration
-integration, and the controlled unit tests.
+integration, and the controlled unit tests. Python syntax checks and pytest
+executions use the isolated environment interpreter.
 
-Two longer process-lifecycle simulations are intentionally executed separately:
+Two longer process-lifecycle simulations are intentionally executed separately
+through the same environment:
 
 ```bash
-./tests/test_restore_retry.py
-./tests/test_run_resume.py
+./scripts/run_repository_test.sh tests/test_restore_retry.py
+./scripts/run_repository_test.sh tests/test_run_resume.py
 ```
+
+To place the generated environment elsewhere:
+
+```bash
+PYTHON_TEST_ENV_DIR=/scratch/npb-dmtcp-test-env \
+./scripts/check_repository.sh
+```
+
+`PYTHON_TEST_BOOTSTRAP` selects the Python executable used to create the
+environment, and `PYTHON_TEST_REQUIREMENTS` selects an alternative requirements
+file. On Ubuntu, `python3-venv` is required to create the environment.
 
 ## 2. Install DMTCP and MPICH
 
@@ -157,11 +177,14 @@ Two longer process-lifecycle simulations are intentionally executed separately:
 
 The installer:
 
-1. installs the required Ubuntu build dependencies;
-2. builds local Autoconf `2.72`;
-3. checks out the exact DMTCP commit;
-4. verifies the checksums of both files in the commit-specific patch bundle;
-5. applies `connectionrewirer-backlog-1024.exact.patch`, changing exactly
+1. installs the required Ubuntu build dependencies, including `python3-pip`
+   and `python3-venv`;
+2. creates or refreshes the isolated repository test environment and installs
+   `pytest` from `requirements-test.txt`;
+3. builds local Autoconf `2.72`;
+4. checks out the exact DMTCP commit;
+5. verifies the checksums of both files in the commit-specific patch bundle;
+6. applies `connectionrewirer-backlog-1024.exact.patch`, changing exactly
    four restore-listener paths from backlog `32` to `1024`:
 
    ```cpp
@@ -171,15 +194,15 @@ The installer:
    _real_listen(udsseqfd, 1024)
    ```
 
-6. applies `kernelbufferdrainer-duplex-refill.patch` as a strict unified diff
+7. applies `kernelbufferdrainer-duplex-refill.patch` as a strict unified diff
    with `--forward`, zero fuzz, and no interactive patch decisions;
-7. verifies the pinned original source checksum, the exact patch checksum,
+8. verifies the pinned original source checksum, the exact patch checksum,
    and the receive-capacity implementation markers in the patched source;
-8. verifies or raises `net.core.somaxconn` to at least `1024`;
-9. builds DMTCP and verifies that the installed `libdmtcp_ipc.so` contains
+9. verifies or raises `net.core.somaxconn` to at least `1024`;
+10. builds DMTCP and verifies that the installed `libdmtcp_ipc.so` contains
    both the duplex state-machine and receive-capacity implementation markers;
-10. builds MPICH `5.0.0` with `ch3:nemesis` and embedded hwloc without libudev;
-11. writes a reproducibility manifest and environment helper, including the
+11. builds MPICH `5.0.0` with `ch3:nemesis` and embedded hwloc without libudev;
+12. writes a reproducibility manifest and environment helper, including the
     exact patch-file checksum, resulting source checksum, and installed plugin
     checksum.
 
@@ -668,6 +691,19 @@ generated restart script is executed without additional coordinator arguments.
 | `RESTORE_NET_CORE_RMEM_MAX_PATH` | `/proc/sys/net/core/rmem_max` | Testable `rmem_max` sysctl path |
 | `RESTORE_NET_IPV4_TCP_RMEM_PATH` | `/proc/sys/net/ipv4/tcp_rmem` | Testable `tcp_rmem` sysctl path |
 
+### Isolated Python test environment
+
+| Variable | Default | Purpose |
+|---|---:|---|
+| `PYTHON_TEST_ENV_DIR` | `<repository>/.test-env` | Isolated environment containing pip and pytest |
+| `PYTHON_TEST_BOOTSTRAP` | `python3` | Python executable used to create the environment |
+| `PYTHON_TEST_REQUIREMENTS` | `<repository>/requirements-test.txt` | Requirements installed into the environment |
+
+The environment directory is generated locally and ignored by Git.
+`scripts/check_repository.sh` prepares it automatically, while
+`scripts/run_repository_test.sh` ensures it is ready before executing any
+selected pytest test.
+
 ### Installation and build overrides
 
 | Variable | Default | Used by |
@@ -890,6 +926,18 @@ per_run_results.csv
 aggregate_results.csv
 ```
 
+For each baseline group, the console prints total runtime as mean ± sample
+standard deviation. For each checkpoint/restart target, when more than one
+successful repetition is available, every displayed numeric metric is printed
+as `mean ± sample SD`, including total time, checkpoint time, cleanup time,
+restore time, attempt count, measured workflow overhead, total DMTCP overhead,
+residual difference, and checkpoint size. A target with one successful
+repetition is printed as a single value.
+
+`aggregate_results.csv` always includes separate `_mean` and `_std` columns for
+each aggregate metric. The standard deviation is `0` for a group with one
+successful repetition.
+
 ## Tests
 
 Run the repository checker and its controlled unit tests:
@@ -898,11 +946,12 @@ Run the repository checker and its controlled unit tests:
 ./scripts/check_repository.sh
 ```
 
-Then run the two longer process-lifecycle simulations:
+Then run the two longer process-lifecycle simulations through the isolated
+Python environment:
 
 ```bash
-./tests/test_restore_retry.py
-./tests/test_run_resume.py
+./scripts/run_repository_test.sh tests/test_restore_retry.py
+./scripts/run_repository_test.sh tests/test_run_resume.py
 ```
 
 The test suite covers:
@@ -920,7 +969,9 @@ The test suite covers:
 - final canonical-log refresh after delayed restored-application output;
 - pre-run cleanup, incomplete-run replacement, success-marker creation, and
   resume skipping;
-- marker-based result summarization and rejection of unmarked runs.
+- marker-based result summarization and rejection of unmarked runs;
+- checkpoint/restart console reporting with mean ± sample standard deviation;
+- isolated pip/pytest environment creation and use by repository checks.
 
 ## Emergency cleanup
 

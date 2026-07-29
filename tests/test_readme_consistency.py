@@ -25,6 +25,7 @@ README_PATH = REPO_ROOT / "README.md"
 EXCLUDED_PARTS = {
     ".git",
     ".idea",
+    ".test-env",
     ".pytest_cache",
     ".mypy_cache",
     ".ruff_cache",
@@ -90,6 +91,9 @@ PUBLIC_CONFIGURATION_VARIABLES = {
     "NPB_VERSION",
     "NPB_URL",
     "NPB_TARGET",
+    "PYTHON_TEST_ENV_DIR",
+    "PYTHON_TEST_BOOTSTRAP",
+    "PYTHON_TEST_REQUIREMENTS",
 }
 
 REQUIRED_ARTIFACTS = {
@@ -178,9 +182,11 @@ def test_readme_matches_repository() -> None:
     for artifact in sorted(REQUIRED_ARTIFACTS):
         assert artifact in readme, f"README does not document artifact {artifact}"
 
+    assert "./scripts/setup_python_test_env.sh" in readme
     assert "./scripts/check_repository.sh" in readme
-    assert "./tests/test_restore_retry.py" in readme
-    assert "./tests/test_run_resume.py" in readme
+    assert "./scripts/run_repository_test.sh tests/test_restore_retry.py" in readme
+    assert "./scripts/run_repository_test.sh tests/test_run_resume.py" in readme
+    assert "mean ± sample SD" in readme
 
     generic_fix_sections = (
         "### Receive-buffer refill capacity fix",

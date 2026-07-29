@@ -109,6 +109,7 @@ sudo apt install -y \
   perl \
   patch \
   python3 \
+  python3-pip \
   python3-venv \
   texinfo \
   help2man \
@@ -126,6 +127,9 @@ sudo apt install -y \
   libncurses-dev \
   zlib1g-dev \
   libibverbs-dev
+
+echo "Preparing the isolated repository Python test environment..."
+"${SCRIPT_DIR}/setup_python_test_env.sh"
 
 cd "${BUILD_ROOT}"
 

@@ -1,0 +1,2 @@
+# Isolated repository test dependency.
+pytest>=7.4,<10

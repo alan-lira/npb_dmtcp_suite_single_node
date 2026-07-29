@@ -18,6 +18,16 @@ report_error() {
   failed=1
 }
 
+PYTHON_TEST_ENV_DIR="${PYTHON_TEST_ENV_DIR:-${REPO_ROOT}/.test-env}"
+export PYTHON_TEST_ENV_DIR
+
+if TEST_PYTHON="$("${SCRIPT_DIR}/setup_python_test_env.sh" --print-python)"; then
+  printf '[OK] Isolated Python test environment: %s\n' "${PYTHON_TEST_ENV_DIR}"
+else
+  report_error 'could not prepare the isolated Python test environment'
+  exit 1
+fi
+
 for script in "${SCRIPT_DIR}"/*.sh; do
   if bash -n "${script}"; then
     printf '[OK] Bash syntax: %s\n' "${script#${REPO_ROOT}/}"
@@ -63,7 +73,7 @@ else
 fi
 
 for script in "${SCRIPT_DIR}"/*.py "${TEST_DIR}"/*.py; do
-  if python3 - "${script}" <<'PY'
+  if "${TEST_PYTHON}" - "${script}" <<'PY'
 from pathlib import Path
 import sys
 path = Path(sys.argv[1])
@@ -295,28 +305,49 @@ else
   report_error 'default pre-run process cleanup integration is incomplete'
 fi
 
-for test_script in \
-  test_summarize_results.py \
-  test_readme_consistency.py \
-  test_repository_contract.py \
-  test_dmtcp_patch_application.py \
-  test_refill_receive_capacity.py \
-  test_restore_port_reservation.py \
-  test_restore_tcp_receive_window.py \
-  test_adaptive_pre_restore_cleanup.py; do
+if [ -x "${SCRIPT_DIR}/setup_python_test_env.sh" ] && \
+   [ -x "${SCRIPT_DIR}/run_repository_test.sh" ] && \
+   [ -f "${REPO_ROOT}/requirements-test.txt" ] && \
+   grep -Fq 'pytest>=7.4' "${REPO_ROOT}/requirements-test.txt" && \
+   grep -Fq 'python3-pip' "${SCRIPT_DIR}/install_dmtcp_mpich_env.sh" && \
+   grep -Fq 'setup_python_test_env.sh' "${SCRIPT_DIR}/install_dmtcp_mpich_env.sh" && \
+   grep -Fq 'Isolated Python test environment' "${REPO_ROOT}/README.md"; then
+  printf '[OK] Isolated pip/pytest test environment integration\n'
+else
+  report_error 'isolated pip/pytest test environment integration is incomplete'
+fi
+
+unit_test_scripts=(
+  test_summarize_results.py
+  test_readme_consistency.py
+  test_repository_contract.py
+  test_dmtcp_patch_application.py
+  test_refill_receive_capacity.py
+  test_restore_port_reservation.py
+  test_restore_tcp_receive_window.py
+  test_adaptive_pre_restore_cleanup.py
+)
+
+unit_test_paths=()
+for test_script in "${unit_test_scripts[@]}"; do
   printf '[RUN] Test: tests/%s\n' "${test_script}"
-  test_log="$(mktemp)"
-  if PYTHONDONTWRITEBYTECODE=1 \
-     PYTEST_ADDOPTS="${PYTEST_ADDOPTS:-} -p no:cacheprovider" \
-     "${TEST_DIR}/${test_script}" > "${test_log}" 2>&1; then
-    cat "${test_log}"
-    printf '[OK] Test passed: tests/%s\n' "${test_script}"
-  else
-    cat "${test_log}" >&2
-    report_error "test failed: tests/${test_script}"
-  fi
-  rm -f -- "${test_log}"
+  unit_test_paths+=("${TEST_DIR}/${test_script}")
 done
+
+test_log="$(mktemp)"
+if PYTHONDONTWRITEBYTECODE=1 \
+   "${TEST_PYTHON}" -m pytest -p no:cacheprovider \
+   "${unit_test_paths[@]}" > "${test_log}" 2>&1; then
+  cat "${test_log}"
+  for test_script in "${unit_test_scripts[@]}"; do
+    printf '[OK] Test passed: tests/%s\n' "${test_script}"
+  done
+else
+  cat "${test_log}" >&2
+  report_error 'controlled pytest suite failed'
+fi
+rm -f -- "${test_log}"
+
 
 printf '[INFO] Environment-sensitive integration tests are run separately: tests/test_restore_retry.py and tests/test_run_resume.py\n'
 
@@ -326,6 +357,7 @@ while IFS= read -r -d '' path; do
 done < <(
   find "${REPO_ROOT}" \
     -path "${REPO_ROOT}/output" -prune -o \
+    -path "${PYTHON_TEST_ENV_DIR}" -prune -o \
     \( -type d \( -name .idea -o -name .pytest_cache -o -name __pycache__ \) \
        -o -type f \( -name '*.pyc' -o -name '*.pyo' \) \) \
     -print0

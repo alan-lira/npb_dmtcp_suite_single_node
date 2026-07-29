@@ -436,6 +436,24 @@ def format_value(value: object, digits: int = 2) -> str:
     return f"{float(value):.{digits}f}"
 
 
+def format_aggregate_metric(
+    row: Dict[str, object],
+    metric: str,
+    repetitions: int,
+    digits: int = 2,
+    suffix: str = "",
+) -> str:
+    mean_value = row.get(f"{metric}_mean")
+    if not isinstance(mean_value, (int, float)):
+        return "N/A"
+
+    text = f"{float(mean_value):.{digits}f}"
+    std_value = row.get(f"{metric}_std")
+    if repetitions > 1 and isinstance(std_value, (int, float)):
+        text += f" ± {float(std_value):.{digits}f}"
+    return f"{text}{suffix}"
+
+
 def target_label(row: Dict[str, object]) -> str:
     if row["scenario"] == "baseline":
         return "baseline"
@@ -485,12 +503,18 @@ def print_console_summary(
             continue
 
         print()
-        print(
-            "Target | Reps | Total (s) | Checkpoint (s) | Cleanup (s) | "
-            "Restore (s) | Attempts | Workflow (s) | Total DMTCP | Residual difference | Size (GB)"
+        print("Checkpoint/restart values are mean ± sample SD when Reps > 1.")
+        header = (
+            f"{'Target':>7} | {'Reps':>4} | {'Total (s)':>17} | "
+            f"{'Checkpoint (s)':>17} | {'Cleanup (s)':>17} | "
+            f"{'Restore (s)':>17} | {'Attempts':>14} | "
+            f"{'Workflow (s)':>17} | {'Total DMTCP':>27} | "
+            f"{'Residual difference':>31} | {'Size (GB)':>17}"
         )
-        print("-" * 160)
+        print(header)
+        print("-" * len(header))
         for row in cr_rows:
+            repetitions = int(row["successful_repetitions"])
             total_direction = short_direction(
                 row.get("total_dmtcp_related_overhead_seconds_mean")
             )
@@ -498,25 +522,35 @@ def print_console_summary(
                 row.get("residual_dmtcp_runtime_difference_seconds_mean")
             )
             total_summary = (
-                f"{format_value(row['total_dmtcp_related_overhead_percent_mean'])}% "
-                f"({total_direction})"
+                format_aggregate_metric(
+                    row,
+                    "total_dmtcp_related_overhead_percent",
+                    repetitions,
+                    suffix="%",
+                )
+                + f" ({total_direction})"
             )
             residual_summary = (
-                f"{format_value(row['residual_dmtcp_runtime_difference_seconds_mean'])} s "
-                f"({residual_direction_short})"
+                format_aggregate_metric(
+                    row,
+                    "residual_dmtcp_runtime_difference_seconds",
+                    repetitions,
+                    suffix=" s",
+                )
+                + f" ({residual_direction_short})"
             )
             print(
                 f"{target_label(row):>7} | "
-                f"{int(row['successful_repetitions']):4d} | "
-                f"{format_value(row['total_seconds_mean']):>9} | "
-                f"{format_value(row['checkpoint_seconds_mean']):>14} | "
-                f"{format_value(row['pre_restore_cleanup_seconds_mean']):>11} | "
-                f"{format_value(row['restore_seconds_mean']):>11} | "
-                f"{format_value(row['restore_attempt_count_mean'], 1):>8} | "
-                f"{format_value(row['checkpoint_restore_workflow_overhead_seconds_mean']):>12} | "
-                f"{total_summary:>19} | "
-                f"{residual_summary:>24} | "
-                f"{format_value(row['checkpoint_size_gb_mean']):>9}"
+                f"{repetitions:4d} | "
+                f"{format_aggregate_metric(row, 'total_seconds', repetitions):>17} | "
+                f"{format_aggregate_metric(row, 'checkpoint_seconds', repetitions):>17} | "
+                f"{format_aggregate_metric(row, 'pre_restore_cleanup_seconds', repetitions):>17} | "
+                f"{format_aggregate_metric(row, 'restore_seconds', repetitions):>17} | "
+                f"{format_aggregate_metric(row, 'restore_attempt_count', repetitions, 1):>14} | "
+                f"{format_aggregate_metric(row, 'checkpoint_restore_workflow_overhead_seconds', repetitions):>17} | "
+                f"{total_summary:>27} | "
+                f"{residual_summary:>31} | "
+                f"{format_aggregate_metric(row, 'checkpoint_size_gb', repetitions):>17}"
             )
 
 

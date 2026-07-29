@@ -38,6 +38,10 @@ def test_repository_contract() -> None:
     cleanup = (SCRIPTS / "adaptive_pre_restore_cleanup.py").read_text(encoding="utf-8")
     reservation = (SCRIPTS / "restore_port_reservation.py").read_text(encoding="utf-8")
     receive_window = (SCRIPTS / "restore_tcp_receive_window.py").read_text(encoding="utf-8")
+    test_env_setup = (SCRIPTS / "setup_python_test_env.sh").read_text(encoding="utf-8")
+    test_runner = (SCRIPTS / "run_repository_test.sh").read_text(encoding="utf-8")
+    checker = (SCRIPTS / "check_repository.sh").read_text(encoding="utf-8")
+    requirements_test = (REPO_ROOT / "requirements-test.txt").read_text(encoding="utf-8")
     readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
     patch_dir = (
         REPO_ROOT
@@ -68,6 +72,24 @@ def test_repository_contract() -> None:
     require('BUILD_JOBS="${BUILD_JOBS:-8}"' in installer, "BUILD_JOBS default is missing")
     require('make -j"${BUILD_JOBS}"' in installer, "installer does not use BUILD_JOBS")
     require('make -j"$(nproc)"' not in installer, "unbounded nproc build remains")
+
+    require("python3-pip" in installer, "installer does not install python3-pip")
+    require("python3-venv" in installer, "installer does not install python3-venv")
+    require(
+        '"${SCRIPT_DIR}/setup_python_test_env.sh"' in installer,
+        "installer does not prepare the isolated Python test environment",
+    )
+    require("pytest>=7.4" in requirements_test, "pytest test requirement is missing")
+    require("python3 -m venv" not in test_env_setup, "setup script must honor its bootstrap override")
+    require("-m venv" in test_env_setup, "setup script does not create a virtual environment")
+    require("-m ensurepip" in test_env_setup, "setup script does not ensure pip is available")
+    require("-m pip install" in test_env_setup, "setup script does not install test requirements")
+    require("import pip, pytest" in test_env_setup, "setup script does not verify pip and pytest")
+    require("setup_python_test_env.sh" in test_runner, "test wrapper does not prepare the environment")
+    require("-m pytest" in test_runner, "test wrapper does not execute pytest")
+    require("setup_python_test_env.sh" in checker, "repository checker does not prepare the environment")
+    require('"${TEST_PYTHON}" -m pytest' in checker, "repository checker bypasses the isolated environment")
+    require("Isolated Python test environment" in readme, "README test-environment documentation missing")
 
     require(
         "FROM=jalib::JServerSocket restoreSocket(sockAddr, 0);" in backlog_patch,
@@ -192,6 +214,18 @@ def test_repository_contract() -> None:
     require("successful_restore_attempt_seconds.txt" in run_one, "successful-attempt metric is missing")
     require("restore_attempt_count" in summarizer, "summarizer does not expose restore-attempt counts")
     require("restore_retry_count" in summarizer, "summarizer does not expose restore-retry counts")
+    require(
+        "format_aggregate_metric" in summarizer,
+        "summarizer does not format aggregate mean and standard deviation",
+    )
+    require(
+        "Checkpoint/restart values are mean ± sample SD when Reps > 1." in summarizer,
+        "summarizer does not explain checkpoint/restart mean ± SD output",
+    )
+    require(
+        "mean ± sample SD" in readme,
+        "README does not document checkpoint/restart mean ± SD output",
+    )
     require("Automatic restore retries" in readme, "README restore-retry documentation missing")
     require(
         'RESTORE_RESERVE_ORIGINAL_TCP_PORTS="${RESTORE_RESERVE_ORIGINAL_TCP_PORTS:-true}"'
@@ -319,8 +353,11 @@ def test_repository_contract() -> None:
     generated_cache_paths = [
         path
         for path in REPO_ROOT.rglob("*")
-        if path.name in {".idea", ".pytest_cache", "__pycache__"}
-        or path.suffix in {".pyc", ".pyo"}
+        if ".test-env" not in path.relative_to(REPO_ROOT).parts
+        and (
+            path.name in {".idea", ".pytest_cache", "__pycache__"}
+            or path.suffix in {".pyc", ".pyo"}
+        )
     ]
     require(
         not generated_cache_paths,
