@@ -297,6 +297,7 @@ fi
 
 for test_script in \
   test_summarize_results.py \
+  test_readme_consistency.py \
   test_repository_contract.py \
   test_dmtcp_patch_application.py \
   test_refill_receive_capacity.py \
@@ -305,7 +306,9 @@ for test_script in \
   test_adaptive_pre_restore_cleanup.py; do
   printf '[RUN] Test: tests/%s\n' "${test_script}"
   test_log="$(mktemp)"
-  if "${TEST_DIR}/${test_script}" > "${test_log}" 2>&1; then
+  if PYTHONDONTWRITEBYTECODE=1 \
+     PYTEST_ADDOPTS="${PYTEST_ADDOPTS:-} -p no:cacheprovider" \
+     "${TEST_DIR}/${test_script}" > "${test_log}" 2>&1; then
     cat "${test_log}"
     printf '[OK] Test passed: tests/%s\n' "${test_script}"
   else
@@ -317,10 +320,23 @@ done
 
 printf '[INFO] Environment-sensitive integration tests are run separately: tests/test_restore_retry.py and tests/test_run_resume.py\n'
 
-if [ -d "${REPO_ROOT}/.idea" ]; then
-  report_error '.idea/ should not be included in the delivered repository'
+unwanted_paths=()
+while IFS= read -r -d '' path; do
+  unwanted_paths+=("${path}")
+done < <(
+  find "${REPO_ROOT}" \
+    -path "${REPO_ROOT}/output" -prune -o \
+    \( -type d \( -name .idea -o -name .pytest_cache -o -name __pycache__ \) \
+       -o -type f \( -name '*.pyc' -o -name '*.pyo' \) \) \
+    -print0
+)
+
+if [ "${#unwanted_paths[@]}" -gt 0 ]; then
+  for path in "${unwanted_paths[@]}"; do
+    report_error "generated IDE/cache artifact is present: ${path#${REPO_ROOT}/}"
+  done
 else
-  printf '[OK] No .idea directory\n'
+  printf '[OK] No IDE metadata or Python/test cache artifacts\n'
 fi
 
 exit "${failed}"

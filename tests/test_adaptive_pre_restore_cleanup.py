@@ -9,6 +9,10 @@
 
 from __future__ import annotations
 
+import sys
+
+sys.dont_write_bytecode = True
+
 import json
 import os
 from pathlib import Path
@@ -380,4 +384,4 @@ def test_pid_start_time_mismatch_is_not_signaled(tmp_path: Path) -> None:
 
 
 if __name__ == "__main__":
-    raise SystemExit(pytest.main([__file__]))
+    raise SystemExit(pytest.main([__file__, "-p", "no:cacheprovider"]))

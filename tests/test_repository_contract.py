@@ -2,10 +2,16 @@
 
 # Copyright 2026 Alan Lira Nunes
 # SPDX-License-Identifier: Apache-2.0
+# Licensed under the Apache License, Version 2.0.
+# See the LICENSE file in the repository root for details.
 
 """Static contract tests for the current repository workflow."""
 
 from __future__ import annotations
+
+import sys
+
+sys.dont_write_bytecode = True
 
 from pathlib import Path
 import hashlib
@@ -297,8 +303,31 @@ def test_repository_contract() -> None:
     require("legacy_baseline_target" not in summarizer, "old baseline name parser remains")
     require("replace|skip|error" not in run_one + run_all, "old skip policy remains")
     require(not (REPO_ROOT / ".idea").exists(), ".idea directory is present")
+    require(
+        (REPO_ROOT / "tests" / "test_readme_consistency.py").is_file(),
+        "README consistency test is missing",
+    )
+    checker = (SCRIPTS / "check_repository.sh").read_text(encoding="utf-8")
+    require(
+        "test_readme_consistency.py" in checker,
+        "repository checker does not run the README consistency test",
+    )
+    require(
+        "No IDE metadata or Python/test cache artifacts" in checker,
+        "repository checker does not reject generated IDE/cache artifacts",
+    )
+    generated_cache_paths = [
+        path
+        for path in REPO_ROOT.rglob("*")
+        if path.name in {".idea", ".pytest_cache", "__pycache__"}
+        or path.suffix in {".pyc", ".pyo"}
+    ]
+    require(
+        not generated_cache_paths,
+        f"generated IDE/cache artifacts are present: {generated_cache_paths}",
+    )
 
 
 
 if __name__ == "__main__":
-    raise SystemExit(pytest.main([__file__]))
+    raise SystemExit(pytest.main([__file__, "-p", "no:cacheprovider"]))

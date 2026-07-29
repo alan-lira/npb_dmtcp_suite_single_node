@@ -2,10 +2,16 @@
 
 # Copyright 2026 Alan Lira Nunes
 # SPDX-License-Identifier: Apache-2.0
+# Licensed under the Apache License, Version 2.0.
+# See the LICENSE file in the repository root for details.
 
 """Integration test for bounded same-checkpoint restore retries."""
 
 from __future__ import annotations
+
+import sys
+
+sys.dont_write_bytecode = True
 
 import os
 from pathlib import Path
@@ -303,4 +309,4 @@ def test_bounded_same_checkpoint_restore_retry() -> None:
 
 
 if __name__ == "__main__":
-    raise SystemExit(pytest.main([__file__]))
+    raise SystemExit(pytest.main([__file__, "-p", "no:cacheprovider"]))

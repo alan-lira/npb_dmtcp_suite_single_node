@@ -2,10 +2,16 @@
 
 # Copyright 2026 Alan Lira Nunes
 # SPDX-License-Identifier: Apache-2.0
+# Licensed under the Apache License, Version 2.0.
+# See the LICENSE file in the repository root for details.
 
 """Controlled tests for restore-scoped TCP receive-window transactions."""
 
 from __future__ import annotations
+
+import sys
+
+sys.dont_write_bytecode = True
 
 import importlib.util
 import json
@@ -223,4 +229,4 @@ def test_invalid_target_order_is_rejected_without_modifying_files(
 
 
 if __name__ == "__main__":
-    raise SystemExit(pytest.main([__file__]))
+    raise SystemExit(pytest.main([__file__, "-p", "no:cacheprovider"]))

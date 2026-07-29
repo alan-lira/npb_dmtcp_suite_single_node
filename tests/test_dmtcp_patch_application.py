@@ -1,8 +1,17 @@
 #!/usr/bin/env python3
 
+# Copyright 2026 Alan Lira Nunes
+# SPDX-License-Identifier: Apache-2.0
+# Licensed under the Apache License, Version 2.0.
+# See the LICENSE file in the repository root for details.
+
 """Validate that the versioned unified DMTCP patch is structurally applicable."""
 
 from __future__ import annotations
+
+import sys
+
+sys.dont_write_bytecode = True
 
 from pathlib import Path
 import re
@@ -107,4 +116,4 @@ def test_patch_applies_with_zero_fuzz(tmp_path: Path) -> None:
 
 
 if __name__ == "__main__":
-    raise SystemExit(pytest.main([__file__]))
+    raise SystemExit(pytest.main([__file__, "-p", "no:cacheprovider"]))

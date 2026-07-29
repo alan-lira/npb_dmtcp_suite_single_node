@@ -2,10 +2,16 @@
 
 # Copyright 2026 Alan Lira Nunes
 # SPDX-License-Identifier: Apache-2.0
+# Licensed under the Apache License, Version 2.0.
+# See the LICENSE file in the repository root for details.
 
 """Integration test for marker-based current-format result summarization."""
 
 from __future__ import annotations
+
+import sys
+
+sys.dont_write_bytecode = True
 
 import csv
 from pathlib import Path
@@ -131,4 +137,4 @@ def test_summarizer_uses_markers_and_current_artifact_names() -> None:
 
 
 if __name__ == "__main__":
-    raise SystemExit(pytest.main([__file__]))
+    raise SystemExit(pytest.main([__file__, "-p", "no:cacheprovider"]))

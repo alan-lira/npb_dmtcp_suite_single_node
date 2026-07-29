@@ -8,14 +8,14 @@ The validated software profile is:
 - DMTCP commit `6896e12276a9fe449edb0cf206203ce01b19efe6`;
 - DMTCP restore-listener backlog patched from `32` to `1024` for the primary
   IPv4 `JServerSocket`, IPv6, Unix-stream, and Unix-seqpacket restore sockets;
-- DMTCP stream-buffer refill replaced with a receive-capacity-aware nonblocking duplex state machine.
-  It prevents symmetric write/write refill
+- DMTCP stream-buffer refill replaced with a receive-capacity-aware
+  nonblocking duplex state machine. It prevents symmetric write/write refill
   deadlocks and temporarily enlarges reconstructed receive buffers when saved
   application data exceeds the kernel default;
 - Linux `net.core.somaxconn` verified at `1024` or greater;
 - MPICH `5.0.0` using `ch3:nemesis`;
 - MPICH embedded hwloc built without libudev;
-- NPB-MPI `3.4`, Class `D`.
+- NAS Parallel Benchmarks archive `3.4.4` (`NPB3.4-MPI` source tree), Class `D`.
 
 The supported benchmarks and rank constraints are:
 
@@ -23,6 +23,19 @@ The supported benchmarks and rank constraints are:
   `1, 4, 9, 16, 25, 36, 49, ...`;
 - **CG.D**: the MPI rank count must be a power of two, such as
   `1, 2, 4, 8, 16, 32, 64, ...`.
+
+## Platform and privilege requirements
+
+The suite targets a Linux single node with `/proc`, `/proc/sys`, Bash, Python 3,
+and the standard process/socket inspection utilities used by the diagnostics.
+The installation script is Ubuntu-oriented and uses `sudo apt` for build
+dependencies.
+
+Checkpoint/restart runs normally require `root` or equivalent privileges because
+the restore workflow temporarily updates `net.ipv4.ip_local_reserved_ports`,
+`net.core.rmem_max`, and `net.ipv4.tcp_rmem`. Both kernel transactions are
+serialized, verified, and restored on success, failure, or signal cleanup. The
+suite is designed for one active experiment per user on a node.
 
 ## Validated checkpoint/restart workflow
 
@@ -68,7 +81,11 @@ coordinator during restart.
 
 ## Repository structure
 
+<!-- BEGIN REPOSITORY STRUCTURE -->
 ```text
+.gitignore
+LICENSE
+README.md
 patches/
   dmtcp-6896e12276a9fe449edb0cf206203ce01b19efe6/
     README.md
@@ -76,46 +93,61 @@ patches/
     kernelbufferdrainer-duplex-refill.patch
 scripts/
   adaptive_pre_restore_cleanup.py
-  restore_port_reservation.py
-  restore_tcp_receive_window.py
   build_npb_bt_cg_d.sh
   check_repository.sh
   experiment_config.sh
   install_dmtcp_mpich_env.sh
   install_npb_mpi.sh
   kill_dmtcp_processes.sh
+  restore_port_reservation.py
+  restore_tcp_receive_window.py
   run_all.sh
   run_one.sh
   summarize_results.py
   verify_single_node_environment.sh
-
 tests/
   test_adaptive_pre_restore_cleanup.py
+  test_dmtcp_patch_application.py
+  test_readme_consistency.py
+  test_refill_receive_capacity.py
   test_repository_contract.py
   test_restore_port_reservation.py
-  test_restore_tcp_receive_window.py
   test_restore_retry.py
+  test_restore_tcp_receive_window.py
   test_run_resume.py
   test_summarize_results.py
-
 output/                         # generated; ignored by Git
   binaries/
   results/
 ```
+<!-- END REPOSITORY STRUCTURE -->
 
 ## 1. Check the repository
 
 From the repository root:
 
 ```bash
-chmod +x scripts/*.sh scripts/*.py tests/*.py
 ./scripts/check_repository.sh
 ```
 
-The checker validates Bash and Python syntax, executable permissions, both
-version-specific DMTCP patch assets and their checksums, the current
-output-artifact contract, success-marker/resume integration, pre-run cleanup
-integration, and the controlled tests under `tests/`.
+Ensure the repository scripts and tests are executable before running the
+checks:
+
+```bash
+chmod +x scripts/*.sh scripts/*.py tests/*.py
+```
+
+The checker validates Bash and Python syntax, executable permissions, unwanted
+IDE/cache artifacts, the version-specific DMTCP patch assets and checksums,
+README/repository consistency, current output-artifact names, configuration
+integration, and the controlled unit tests.
+
+Two longer process-lifecycle simulations are intentionally executed separately:
+
+```bash
+./tests/test_restore_retry.py
+./tests/test_run_resume.py
+```
 
 ## 2. Install DMTCP and MPICH
 
@@ -166,7 +198,8 @@ its four `TO` values must not already exist; otherwise installation stops
 without modifying the source. This avoids silently applying the backlog change
 to an unexpected DMTCP source layout.
 
-`kernelbufferdrainer-duplex-refill.patch` is a standard unified diff. The installer first verifies the pinned original source checksum, applies the
+`kernelbufferdrainer-duplex-refill.patch` is a standard unified diff. The
+installer first verifies the pinned original source checksum, applies the
 diff with zero fuzz, and then verifies the resulting source and implementation
 markers. During restart, the patch uses `SO_RCVBUF` and, when the normal kernel
 limit is insufficient, `SO_RCVBUFFORCE`. The original receive-buffer setting is
@@ -283,11 +316,20 @@ The default generated layout is:
 ```text
 <repository>/output/
 ├── binaries/
+│   ├── bt.D.x
+│   ├── cg.D.x
+│   └── build_manifest.txt
 └── results/
+    ├── <benchmark><class>_np<ranks>_baseline_reference_seconds.txt
+    ├── <benchmark><class>_np<ranks>_checkpoint_schedule.tsv
     ├── per_run_results.csv
     ├── aggregate_results.csv
     └── <run-name>/
 ```
+
+The baseline-reference and checkpoint-schedule files are generated by
+`run_all.sh` for each requested benchmark/rank combination. The CSV files are
+generated by `summarize_results.py` after the matrix completes.
 
 Redirect all generated artifacts with one variable:
 
@@ -544,49 +586,120 @@ excluding the cleanup script and its caller ancestry. This prevents a shell or
 test harness that merely mentions a matched executable name from being killed.
 The suite is intended for one experiment at a time on a single node.
 
-## Main configuration variables
+## Configuration reference
+
+### Paths and stack selection
+
+| Variable | Default | Purpose |
+|---|---:|---|
+| `OUTPUT_ROOT` | `<repository>/output` | Parent directory for generated binaries and results |
+| `BINARY_ROOT` | `<OUTPUT_ROOT>/binaries` | Built NPB executables |
+| `RESULTS_ROOT` | `<OUTPUT_ROOT>/results` | Run directories, schedules, and summaries |
+| `ENV_FILE` | `~/opt/enable_dmtcp_mpich_env.sh` | Installed DMTCP/MPICH environment helper |
+| `NPB_ROOT` | `~/NPB3.4-MPI` | NPB-MPI source tree |
+| `NPB_CLASS` | `D` | NPB problem class |
+| `REQUIRE_WORKING_STACK` | `true` | Reject a stack that does not match the pinned profile |
+
+The `WORKING_DMTCP_*` and `WORKING_MPICH_*` values in
+`scripts/experiment_config.sh` are reproducibility-contract constants. They
+should be changed only together with the installer, patch bundle, verifier, and
+contract tests.
+
+### Experiment matrix and run policy
 
 | Variable | Default | Purpose |
 |---|---:|---|
 | `BENCHMARKS_TEXT` | `bt cg` | Space-separated benchmark matrix |
 | `MPI_RANKS_TEXT` | `4` | Space-separated MPI-rank matrix |
+| `REPETITIONS` | unset | Optional shorthand that sets both repetition counts |
 | `BASELINE_REPETITIONS` | `3` | Baseline repetitions |
 | `CR_REPETITIONS` | `3` | Repetitions per checkpoint target |
-| `CHECKPOINT_PERCENTAGES_TEXT` | `25 50 75` | Percentage targets |
+| `CHECKPOINT_PERCENTAGES_TEXT` | `25 50 75` | Percentage targets used by `run_all.sh` |
 | `RUN_BASELINE` | `true` | Process baseline entries in the matrix |
-| `EXISTING_RUN_POLICY` | `resume` | Resume, replace, or error |
-| `CHECKPOINT_CLEANUP_MODE` | `delete-checkpoints` | Retain or delete checkpoint files |
+| `EXISTING_RUN_POLICY` | `resume` | `resume`, `replace`, or `error` |
+| `CHECKPOINT_CLEANUP_MODE` | `delete-checkpoints` | `delete-checkpoints` or `keep-checkpoints` |
+| `BASELINE_REFERENCE_SECONDS` | unset | Explicit positive baseline for percentage mode |
+
+### Coordinator, checkpoint, and progress controls
+
+| Variable | Default | Purpose |
+|---|---:|---|
+| `DMTCP_COORD_PORT` | automatic | Force one coordinator port instead of random selection |
+| `DMTCP_PORT_MIN` | `20000` | Random coordinator-port lower bound |
+| `DMTCP_PORT_MAX` | `39999` | Random coordinator-port upper bound |
+| `DMTCP_EXPERIMENT_SIGNAL` | `30` | Signal used by DMTCP for checkpointing |
+| `COORDINATOR_START_TIMEOUT_SECONDS` | `30` | Fresh-coordinator readiness timeout |
+| `CHECKPOINT_FILE_TIMEOUT_SECONDS` | `600` | Checkpoint-image and restart-script timeout |
+| `POST_CHECKPOINT_STABILIZATION_SECONDS` | `2` | Grace after checkpoint artifacts are complete |
 | `DMTCP_RESTORE_TIMEOUT_SECONDS` | `600` | Timeout applied independently to each restore attempt |
+| `PROGRESS_INTERVAL_SECONDS` | `30` | Application progress-report interval |
+| `RESTORE_PROGRESS_INTERVAL_SECONDS` | `5` | Restore-state progress-report interval |
+
+`COORDINATOR_LIFECYCLE` is fixed to `fresh` for the validated workflow. The
+generated restart script is executed without additional coordinator arguments.
+
+### Adaptive cleanup and restore retries
+
+| Variable | Default | Purpose |
+|---|---:|---|
+| `PRE_RESTORE_CLEANUP_TIMEOUT_SECONDS` | `180` | Complete adaptive cleanup timeout |
+| `PRE_RESTORE_CLEANUP_POLL_SECONDS` | `0.25` | Cleanup polling interval |
+| `PRE_RESTORE_FORCE_KILL_AFTER_SECONDS` | `10` | Delay before TERM escalation |
+| `PRE_RESTORE_FORCE_KILL_GRACE_SECONDS` | `5` | Delay between TERM and KILL escalation |
+| `PRE_RESTORE_FINAL_GRACE_SECONDS` | `2` | Grace after every captured endpoint is reusable |
+| `PRE_RESTORE_CLEANUP_REPORT_INTERVAL_SECONDS` | `5` | Cleanup progress-report interval |
+| `RESTORE_BIND_FAILURE_ABORT_SECONDS` | `10` | Persistent bind-error early-abort threshold |
 | `RESTORE_MAX_ATTEMPTS` | `3` | Maximum attempts from the same checkpoint |
-| `RESTORE_RETRY_FINAL_GRACE_SECONDS` | `10` | Verified-clear grace before an actual retry; skipped after the final failed attempt |
+| `RESTORE_RETRY_FINAL_GRACE_SECONDS` | `10` | Verified-clear grace before a real retry; skipped after the final failed attempt |
+
+### Restore-scoped kernel transactions
+
+| Variable | Default | Purpose |
+|---|---:|---|
 | `RESTORE_RESERVE_ORIGINAL_TCP_PORTS` | `true` | Reserve captured IPv4 TCP listeners during restore |
 | `RESTORE_PORT_RESERVATION_LOCK_FILE` | `/run/lock/npb_dmtcp_restore_ports.lock` | Serialize temporary reserved-port changes |
-| `RESTORE_PORT_RESERVATION_LOCK_TIMEOUT_SECONDS` | `30` | Maximum lock-acquisition wait |
+| `RESTORE_PORT_RESERVATION_LOCK_TIMEOUT_SECONDS` | `30` | Maximum reserved-port lock wait |
 | `RESTORE_IP_LOCAL_RESERVED_PORTS_PATH` | `/proc/sys/net/ipv4/ip_local_reserved_ports` | Reserved-port sysctl path |
-| `RESTORE_TUNE_TCP_RECEIVE_WINDOW` | `true` | Apply restore-scoped receive-window floors |
-| `RESTORE_TCP_RECEIVE_WINDOW_LOCK_FILE` | `/run/lock/npb_dmtcp_restore_tcp_receive_window.lock` | Serialize temporary TCP receive-window changes |
+| `RESTORE_TUNE_TCP_RECEIVE_WINDOW` | `true` | Apply restore-scoped TCP receive-window floors |
+| `RESTORE_TCP_RECEIVE_WINDOW_LOCK_FILE` | `/run/lock/npb_dmtcp_restore_tcp_receive_window.lock` | Serialize receive-window changes |
 | `RESTORE_TCP_RECEIVE_WINDOW_LOCK_TIMEOUT_SECONDS` | `30` | Maximum receive-window lock wait |
 | `RESTORE_NET_CORE_RMEM_MAX` | `16777216` | Restore-time `net.core.rmem_max` floor |
 | `RESTORE_NET_IPV4_TCP_RMEM` | `4096 4194304 16777216` | Restore-time `net.ipv4.tcp_rmem` floors |
 | `RESTORE_NET_CORE_RMEM_MAX_PATH` | `/proc/sys/net/core/rmem_max` | Testable `rmem_max` sysctl path |
 | `RESTORE_NET_IPV4_TCP_RMEM_PATH` | `/proc/sys/net/ipv4/tcp_rmem` | Testable `tcp_rmem` sysctl path |
-| `CHECKPOINT_FILE_TIMEOUT_SECONDS` | `600` | Checkpoint-image timeout |
-| `DMTCP_EXPERIMENT_SIGNAL` | `30` | DMTCP checkpoint signal |
-| `DMTCP_PORT_MIN` | `20000` | Random coordinator-port lower bound |
-| `DMTCP_PORT_MAX` | `39999` | Random coordinator-port upper bound |
-| `PRE_RESTORE_CLEANUP_TIMEOUT_SECONDS` | `180` | Complete adaptive cleanup timeout |
-| `PRE_RESTORE_CLEANUP_POLL_SECONDS` | `0.25` | Cleanup polling interval |
-| `PRE_RESTORE_FORCE_KILL_AFTER_SECONDS` | `10` | TERM escalation delay |
-| `PRE_RESTORE_FORCE_KILL_GRACE_SECONDS` | `5` | KILL escalation grace |
-| `PRE_RESTORE_FINAL_GRACE_SECONDS` | `2` | Grace after all endpoints are clear |
-| `PRE_RESTORE_CLEANUP_REPORT_INTERVAL_SECONDS` | `5` | Cleanup progress interval |
-| `RESTORE_BIND_FAILURE_ABORT_SECONDS` | `10` | Persistent bind-error abort threshold |
-| `PROGRESS_INTERVAL_SECONDS` | `30` | Application progress interval |
-| `RESTORE_PROGRESS_INTERVAL_SECONDS` | `5` | Restore progress interval |
 
-## Current run artifacts
+### Installation and build overrides
 
-Baseline directories contain only baseline-relevant output, including:
+| Variable | Default | Used by |
+|---|---:|---|
+| `ROOT_PREFIX` | `~/opt` | DMTCP/MPICH installer |
+| `BUILD_ROOT` | `~/build_dmtcp_mpich` | DMTCP/MPICH installer |
+| `BUILD_JOBS` | `8` | Bounded parallel build jobs |
+| `AUTOCONF_VER` | `2.72` | DMTCP/MPICH installer |
+| `MPICH_VER` | `5.0.0` | DMTCP/MPICH installer; pinned profile requires this version |
+| `DMTCP_REF` | pinned commit | DMTCP/MPICH installer; alternatives are for controlled comparisons |
+| `DMTCP_REPO` | official DMTCP Git repository | DMTCP source location |
+| `NPB_VERSION` | `3.4.4` | NPB installer archive version |
+| `NPB_URL` | official archive URL | NPB installer source URL |
+| `NPB_TARGET` | `~/NPB3.4-MPI` | NPB installer destination |
+
+## Current output artifacts
+
+### Matrix-level files
+
+`run_all.sh` and `summarize_results.py` write these directly below
+`RESULTS_ROOT`:
+
+```text
+<benchmark><class>_np<ranks>_baseline_reference_seconds.txt
+<benchmark><class>_np<ranks>_checkpoint_schedule.tsv
+per_run_results.csv
+aggregate_results.csv
+```
+
+### Common per-run files
+
+Successful baseline and checkpoint/restart directories contain:
 
 ```text
 run_metadata.txt
@@ -601,29 +714,62 @@ run_status.txt
 SUCCESS.marker
 ```
 
-Checkpoint/restart directories additionally contain current checkpoint,
-cleanup, restore, size, and overhead metrics, including:
+`SUCCESS.marker` is authoritative. A directory without it is incomplete even if
+`run_status.txt` contains an intermediate state.
+
+### Checkpoint/restart files
+
+Checkpoint/restart directories additionally contain stable identity,
+checkpoint, cleanup, restore, and overhead artifacts:
 
 ```text
+checkpoint_mode.txt
+checkpoint_percentage.txt
+checkpoint_baseline_seconds.txt
+checkpoint_target_seconds.txt
+dmtcp_signal.txt
+coordinator_lifecycle.txt
+dmtcp_commit.txt
+dmtcp_restore_listen_backlog.txt
+kernel_net_core_somaxconn.txt
+mpich_version.txt
+mpich_device.txt
+dmtcp_coord_port.txt
+coordinator.log
+pre_checkpoint_runtime_seconds.txt
+stdout_before_ckpt.log
+stderr_before_ckpt.log
+dmtcp_clients_before_checkpoint.txt
+dmtcp_list_before_checkpoint.txt
 checkpoint_command_seconds.txt
 checkpoint_file_wait_seconds.txt
 checkpoint_seconds.txt
+checkpoint_image_count.txt
 checkpoint_size_bytes.txt
 checkpoint_size_gb.txt
 checkpoint_size_gib.txt
 checkpoint_mean_per_rank_gb.txt
 checkpoint_mean_per_rank_gib.txt
-checkpoint_image_count.txt
 post_checkpoint_stabilization_seconds.txt
+pre_restore_capture.log
+pre_restore_captured_state.json
+pre_restore_captured_processes.tsv
+pre_restore_captured_sockets.tsv
+pre_restore_cleanup.log
+pre_restore_cleanup_status.txt
 pre_restore_cleanup_seconds.txt
 original_shutdown_seconds.txt
 pre_restore_endpoint_verification_seconds.txt
 pre_restore_final_grace_seconds.txt
+pre_restore_cleanup_removed_unix_sockets.txt
 restore_reserved_tcp_listener_ports.txt
 restore_port_reservation_state.json
 restore_port_reservation_prepare.log
 restore_port_reservation_release.log
 restore_port_reservation_status.txt
+restore_port_reservation_original_value.txt
+restore_port_reservation_applied_value.txt
+restore_port_reservation_released_value.txt
 restore_tcp_receive_window_state.json
 restore_tcp_receive_window_prepare.log
 restore_tcp_receive_window_release.log
@@ -634,23 +780,39 @@ restore_tcp_receive_window_applied_rmem_max.txt
 restore_tcp_receive_window_applied_tcp_rmem.txt
 restore_tcp_receive_window_released_rmem_max.txt
 restore_tcp_receive_window_released_tcp_rmem.txt
+restore_attempts_summary.tsv
+restore_attempts/
+dmtcp_restore_marker_found.txt
+dmtcp_clients_running_after_restore.txt
+dmtcp_list_after_restore_latest.txt
+dmtcp_list_after_restore_confirmed.txt
+stdout_after_restore.log
+stderr_after_restore.log
 dmtcp_restore_seconds.txt
 successful_restore_attempt_seconds.txt
 restore_attempt_count.txt
 restore_retry_count.txt
-restore_attempts_summary.tsv
-restore_attempts/
 post_dmtcp_restore_runtime_seconds.txt
 checkpoint_restore_workflow_overhead_seconds.txt
 total_dmtcp_related_overhead_seconds.txt
 total_dmtcp_related_overhead_percent.txt
 residual_dmtcp_runtime_difference_seconds.txt
-execution_summary.txt
-run_status.txt
-SUCCESS.marker
 ```
 
-This version reads and writes only the current artifact names. Old alias files
+Each `restore_attempts/attempt_NN/` directory preserves the attempt status,
+duration, stdout/stderr, DMTCP state, process/socket diagnostics, bind-failure
+tracking, and exact cleanup capture for a failed attempt. Additional
+`<failure-prefix>_diagnostics.txt`, `<failure-prefix>_processes.txt`,
+`<failure-prefix>_inet_sockets.txt`, and
+`<failure-prefix>_unix_sockets.txt` files are generated only on relevant failure
+paths.
+
+With `keep-checkpoints`, `ckpt_*.dmtcp` files and the generated
+`dmtcp_restart_script*.sh` remain in the run directory. With
+`delete-checkpoints`, successful cleanup records removed artifacts in
+`deleted_checkpoint_artifacts.txt`.
+
+This version reads and writes only the current artifact names. Obsolete aliases
 and old result-directory naming forms are not generated, resumed, or consumed.
 
 ## Result definitions
@@ -730,22 +892,34 @@ aggregate_results.csv
 
 ## Tests
 
-Run all repository checks and controlled tests:
+Run the repository checker and its controlled unit tests:
 
 ```bash
 ./scripts/check_repository.sh
 ```
 
-The tests cover:
+Then run the two longer process-lifecycle simulations:
 
+```bash
+./tests/test_restore_retry.py
+./tests/test_run_resume.py
+```
+
+The test suite covers:
+
+- README structure, configuration, artifact, and test-command consistency;
 - PID/start-time-safe adaptive process cleanup;
 - TCP, UDP, filesystem Unix, and abstract Unix socket reuse;
 - protection against killing an unrelated process after PID/endpoint changes;
-- the version-specific DMTCP backlog and duplex-refill patch bundle, patch
-  checksums, bounded build jobs, and script contract;
+- strict application of the version-specific DMTCP backlog and duplex-refill
+  patches, including checksums and receive-capacity markers;
+- bounded installer build parallelism and pinned-stack contracts;
+- transactional reserved-port and TCP receive-window setup/restoration;
+- space- and tab-separated `tcp_rmem` read-back equivalence;
 - bounded same-checkpoint restore retry after a controlled first-attempt stall;
 - final canonical-log refresh after delayed restored-application output;
-- pre-run cleanup, incomplete-run replacement, success-marker creation, and resume skipping;
+- pre-run cleanup, incomplete-run replacement, success-marker creation, and
+  resume skipping;
 - marker-based result summarization and rejection of unmarked runs.
 
 ## Emergency cleanup
