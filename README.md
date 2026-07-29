@@ -127,6 +127,13 @@ output/                         # generated; ignored by Git
 
 ## 1. Check the repository
 
+Ensure the repository scripts and tests are executable before running the
+checks:
+
+```bash
+chmod +x scripts/*.sh scripts/*.py tests/*.py
+```
+
 The repository tests run inside an isolated Python environment at
 `<repository>/.test-env` by default. The environment contains its own `pip` and
 installs `pytest` from `requirements-test.txt`; it does not depend on a
