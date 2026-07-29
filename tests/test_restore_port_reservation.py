@@ -10,32 +10,34 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import subprocess
-import tempfile
+import sys
+
+import pytest
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 HELPER = REPO_ROOT / "scripts" / "restore_port_reservation.py"
 
 
-def run(*args: str) -> subprocess.CompletedProcess[str]:
+def run_helper(*args: str) -> subprocess.CompletedProcess[str]:
     completed = subprocess.run(
-        [str(HELPER), *args],
+        [sys.executable, str(HELPER), *args],
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         check=False,
+        timeout=15,
     )
-    if completed.returncode != 0:
-        raise AssertionError(
-            f"helper failed ({completed.returncode})\n"
-            f"stdout:\n{completed.stdout}\n"
-            f"stderr:\n{completed.stderr}"
-        )
+    assert completed.returncode == 0, (
+        f"helper failed ({completed.returncode})\n"
+        f"stdout:\n{completed.stdout}\n"
+        f"stderr:\n{completed.stderr}"
+    )
     return completed
 
 
 def write_capture(path: Path, listener_ports: list[int]) -> None:
-    sockets = []
+    sockets: list[dict[str, object]] = []
     inode = 100
     for port in listener_ports:
         sockets.append(
@@ -58,7 +60,8 @@ def write_capture(path: Path, listener_ports: list[int]) -> None:
             }
         )
         inode += 1
-    # These must not be reserved.
+
+    # Established IPv4 connections and IPv6 listeners must not be reserved.
     sockets.extend(
         [
             {
@@ -113,80 +116,86 @@ def write_capture(path: Path, listener_ports: list[int]) -> None:
     )
 
 
-def main() -> int:
-    with tempfile.TemporaryDirectory(prefix="restore-port-reservation-") as temporary:
-        root = Path(temporary)
-        capture = root / "capture.json"
-        sysctl = root / "ip_local_reserved_ports"
-        state = root / "state.json"
-        ports_output = root / "ports.txt"
-        original_output = root / "original.txt"
-        applied_output = root / "applied.txt"
-        released_output = root / "released.txt"
+def test_prepare_merges_listeners_and_release_restores_exact_value(tmp_path: Path) -> None:
+    capture = tmp_path / "capture.json"
+    sysctl = tmp_path / "ip_local_reserved_ports"
+    state = tmp_path / "state.json"
+    ports_output = tmp_path / "ports.txt"
+    original_output = tmp_path / "original.txt"
+    applied_output = tmp_path / "applied.txt"
+    released_output = tmp_path / "released.txt"
 
-        write_capture(capture, [2001, 2002])
-        sysctl.write_text("1000-1002,2000\n", encoding="utf-8")
-        run(
-            "prepare",
-            "--capture-state",
-            str(capture),
-            "--state",
-            str(state),
-            "--sysctl-path",
-            str(sysctl),
-            "--ports-output",
-            str(ports_output),
-            "--original-output",
-            str(original_output),
-            "--applied-output",
-            str(applied_output),
-        )
-        if sysctl.read_text(encoding="utf-8").strip() != "1000-1002,2000-2002":
-            raise AssertionError("captured listeners were not merged correctly")
-        if ports_output.read_text(encoding="utf-8").strip() != "2001-2002":
-            raise AssertionError("listener-port diagnostics are incorrect")
-        run(
-            "release",
-            "--state",
-            str(state),
-            "--sysctl-path",
-            str(sysctl),
-            "--release-output",
-            str(released_output),
-        )
-        if sysctl.read_text(encoding="utf-8").strip() != "1000-1002,2000":
-            raise AssertionError("exact previous reserved-port value was not restored")
+    write_capture(capture, [2001, 2002])
+    sysctl.write_text("1000-1002,2000\n", encoding="utf-8")
+    run_helper(
+        "prepare",
+        "--capture-state",
+        str(capture),
+        "--state",
+        str(state),
+        "--sysctl-path",
+        str(sysctl),
+        "--ports-output",
+        str(ports_output),
+        "--original-output",
+        str(original_output),
+        "--applied-output",
+        str(applied_output),
+    )
 
-        # A concurrent external addition must survive release.
-        state2 = root / "state2.json"
-        sysctl.write_text("1000\n", encoding="utf-8")
-        write_capture(capture, [2000])
-        run(
-            "prepare",
-            "--capture-state",
-            str(capture),
-            "--state",
-            str(state2),
-            "--sysctl-path",
-            str(sysctl),
-        )
-        sysctl.write_text("1000,2000,3000\n", encoding="utf-8")
-        run(
-            "release",
-            "--state",
-            str(state2),
-            "--sysctl-path",
-            str(sysctl),
-        )
-        if sysctl.read_text(encoding="utf-8").strip() != "1000,3000":
-            raise AssertionError("external reserved-port addition was not preserved")
-        state_data = json.loads(state2.read_text(encoding="utf-8"))
-        if not state_data.get("release_concurrent_change_detected"):
-            raise AssertionError("concurrent sysctl change was not recorded")
+    assert sysctl.read_text(encoding="utf-8").strip() == "1000-1002,2000-2002"
+    assert ports_output.read_text(encoding="utf-8").strip() == "2001-2002"
+    assert original_output.read_text(encoding="utf-8").strip() == "1000-1002,2000"
+    assert applied_output.read_text(encoding="utf-8").strip() == "1000-1002,2000-2002"
 
-    print("[OK] restore-port reservation merges, restores, and preserves external changes")
-    return 0
+    run_helper(
+        "release",
+        "--state",
+        str(state),
+        "--sysctl-path",
+        str(sysctl),
+        "--release-output",
+        str(released_output),
+    )
+    assert sysctl.read_text(encoding="utf-8").strip() == "1000-1002,2000"
+    assert released_output.read_text(encoding="utf-8").strip() == "1000-1002,2000"
+
+    state_data = json.loads(state.read_text(encoding="utf-8"))
+    assert state_data["released"] is True
+    assert state_data["release_concurrent_change_detected"] is False
+
+
+def test_release_preserves_concurrent_external_additions(tmp_path: Path) -> None:
+    capture = tmp_path / "capture.json"
+    sysctl = tmp_path / "ip_local_reserved_ports"
+    state = tmp_path / "state.json"
+
+    write_capture(capture, [2000])
+    sysctl.write_text("1000\n", encoding="utf-8")
+    run_helper(
+        "prepare",
+        "--capture-state",
+        str(capture),
+        "--state",
+        str(state),
+        "--sysctl-path",
+        str(sysctl),
+    )
+
+    sysctl.write_text("1000,2000,3000\n", encoding="utf-8")
+    run_helper(
+        "release",
+        "--state",
+        str(state),
+        "--sysctl-path",
+        str(sysctl),
+    )
+
+    assert sysctl.read_text(encoding="utf-8").strip() == "1000,3000"
+    state_data = json.loads(state.read_text(encoding="utf-8"))
+    assert state_data["release_concurrent_change_detected"] is True
+    assert state_data["release_value"] == "1000,3000"
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(pytest.main([__file__]))

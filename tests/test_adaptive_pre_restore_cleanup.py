@@ -12,23 +12,27 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import selectors
 import signal
-import socket
 import subprocess
 import sys
-import tempfile
 import time
-from typing import Dict
+
+import pytest
 
 
-SCRIPT_DIR = Path(__file__).resolve().parent.parent.joinpath("scripts")
+SCRIPT_DIR = Path(__file__).resolve().parent.parent / "scripts"
 HELPER = SCRIPT_DIR / "adaptive_pre_restore_cleanup.py"
+
+pytestmark = pytest.mark.skipif(
+    not Path("/proc/net/tcp").is_file(),
+    reason="Linux /proc socket tables are required",
+)
 
 
 SOCKET_CHILD = r'''
 import json
 import os
-from pathlib import Path
 import signal
 import socket
 import sys
@@ -77,7 +81,6 @@ for sock in (tcp_listener, udp_socket, unix_socket, abstract_socket):
 
 
 TREE_WRAPPER = r'''
-import os
 import signal
 import subprocess
 import sys
@@ -93,6 +96,7 @@ assert child.stdout is not None
 print(child.stdout.readline().strip(), flush=True)
 
 running = True
+
 def stop(_signum, _frame):
     global running
     running = False
@@ -132,49 +136,60 @@ sock.close()
 '''
 
 
-def start_child(code: str, *args: str) -> tuple[subprocess.Popen[str], Dict[str, object]]:
+def _read_startup_metadata(
+    process: subprocess.Popen[str], label: str, timeout: float = 5.0
+) -> dict[str, object]:
+    assert process.stdout is not None
+    selector = selectors.DefaultSelector()
+    selector.register(process.stdout, selectors.EVENT_READ)
+    try:
+        if not selector.select(timeout):
+            raise RuntimeError(f"{label} did not report startup within {timeout} seconds")
+        line = process.stdout.readline().strip()
+    finally:
+        selector.close()
+
+    if not line:
+        stderr = process.stderr.read() if process.stderr is not None else ""
+        raise RuntimeError(f"{label} failed to start: {stderr}")
+    return json.loads(line)
+
+
+def start_child(code: str, *args: str) -> tuple[subprocess.Popen[str], dict[str, object]]:
     process = subprocess.Popen(
         [sys.executable, "-c", code, *args],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
     )
-    assert process.stdout is not None
-    line = process.stdout.readline().strip()
-    if not line:
-        stderr = process.stderr.read() if process.stderr is not None else ""
-        raise RuntimeError(f"socket child failed to start: {stderr}")
-    return process, json.loads(line)
+    return process, _read_startup_metadata(process, "socket child")
 
 
-def start_tree_child(code: str, *args: str) -> tuple[subprocess.Popen[str], Dict[str, object]]:
+def start_tree_child(
+    code: str, *args: str
+) -> tuple[subprocess.Popen[str], dict[str, object]]:
     process = subprocess.Popen(
         [sys.executable, "-c", TREE_WRAPPER, code, *args],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
     )
-    assert process.stdout is not None
-    line = process.stdout.readline().strip()
-    if not line:
-        stderr = process.stderr.read() if process.stderr is not None else ""
-        raise RuntimeError(f"process-tree wrapper failed to start: {stderr}")
-    return process, json.loads(line)
+    return process, _read_startup_metadata(process, "process-tree wrapper")
 
 
-def run(*args: str, expected: int = 0) -> subprocess.CompletedProcess[str]:
+def run_helper(*args: str, expected: int = 0) -> subprocess.CompletedProcess[str]:
     completed = subprocess.run(
         [sys.executable, str(HELPER), *args],
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         check=False,
+        timeout=20,
     )
-    if completed.returncode != expected:
-        raise AssertionError(
-            f"command returned {completed.returncode}, expected {expected}\n"
-            f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}"
-        )
+    assert completed.returncode == expected, (
+        f"command returned {completed.returncode}, expected {expected}\n"
+        f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}"
+    )
     return completed
 
 
@@ -189,15 +204,34 @@ def terminate(process: subprocess.Popen[str]) -> None:
         process.wait(timeout=3)
 
 
-def test_successful_cleanup(temp_root: Path) -> None:
-    unix_path = temp_root / "captured.sock"
+def terminate_pid(pid: int) -> None:
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(0.05)
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
+def test_successful_cleanup(tmp_path: Path) -> None:
+    unix_path = tmp_path / "captured.sock"
     abstract_name = f"npb-dmtcp-cleanup-{os.getpid()}-{time.time_ns()}"
     child, metadata = start_tree_child(SOCKET_CHILD, str(unix_path), abstract_name)
-    state = temp_root / "success-state.json"
-    process_report = temp_root / "success-processes.tsv"
-    socket_report = temp_root / "success-sockets.tsv"
+    descendant_pid = int(metadata["pid"])
+    state = tmp_path / "success-state.json"
+    process_report = tmp_path / "success-processes.tsv"
+    socket_report = tmp_path / "success-sockets.tsv"
     try:
-        run(
+        run_helper(
             "capture",
             "--root-pid",
             str(child.pid),
@@ -209,18 +243,20 @@ def test_successful_cleanup(temp_root: Path) -> None:
             str(socket_report),
         )
         captured = json.loads(state.read_text(encoding="utf-8"))
-        if len(captured["processes"]) < 2:
-            raise AssertionError("descendant process was not captured as part of the tree")
+        assert len(captured["processes"]) >= 2, (
+            "descendant process was not captured as part of the tree"
+        )
         protocols = {item["protocol"] for item in captured["sockets"]}
-        if not {"tcp", "udp", "unix"}.issubset(protocols):
-            raise AssertionError(f"missing captured protocols: {protocols}")
+        assert {"tcp", "udp", "unix"} <= protocols, (
+            f"missing captured protocols: {protocols}"
+        )
 
-        completed = run(
+        completed = run_helper(
             "cleanup",
             "--state",
             str(state),
             "--metrics-dir",
-            str(temp_root),
+            str(tmp_path),
             "--timeout",
             "10",
             "--poll",
@@ -235,30 +271,26 @@ def test_successful_cleanup(temp_root: Path) -> None:
             "0.10",
         )
         child.wait(timeout=3)
-        if unix_path.exists():
-            raise AssertionError("captured stale Unix socket path was not removed")
-        if (temp_root / "pre_restore_cleanup_status.txt").read_text().strip() != "SUCCESS":
-            raise AssertionError("cleanup did not write SUCCESS status")
-        if "All captured socket endpoints are reusable" not in completed.stdout:
-            raise AssertionError("endpoint verification was not reported")
-        print("[OK] adaptive cleanup releases captured processes and TCP/UDP/Unix sockets")
+        assert not unix_path.exists(), "captured stale Unix socket path was not removed"
+        assert (
+            tmp_path / "pre_restore_cleanup_status.txt"
+        ).read_text(encoding="utf-8").strip() == "SUCCESS"
+        assert "All captured socket endpoints are reusable" in completed.stdout
     finally:
         terminate(child)
-        try:
-            unix_path.unlink()
-        except FileNotFoundError:
-            pass
+        terminate_pid(descendant_pid)
+        unix_path.unlink(missing_ok=True)
 
 
-def test_unrelated_owner_is_not_killed(temp_root: Path) -> None:
+def test_unrelated_owner_is_not_killed(tmp_path: Path) -> None:
     original, original_meta = start_child(TCP_CHILD, "0")
     port = int(original_meta["tcp_port"])
-    state = temp_root / "conflict-state.json"
-    process_report = temp_root / "conflict-processes.tsv"
-    socket_report = temp_root / "conflict-sockets.tsv"
+    state = tmp_path / "conflict-state.json"
+    process_report = tmp_path / "conflict-processes.tsv"
+    socket_report = tmp_path / "conflict-sockets.tsv"
     unrelated: subprocess.Popen[str] | None = None
     try:
-        run(
+        run_helper(
             "capture",
             "--root-pid",
             str(original.pid),
@@ -272,12 +304,12 @@ def test_unrelated_owner_is_not_killed(temp_root: Path) -> None:
         terminate(original)
         unrelated, _ = start_child(TCP_CHILD, str(port))
 
-        completed = run(
+        completed = run_helper(
             "cleanup",
             "--state",
             str(state),
             "--metrics-dir",
-            str(temp_root / "conflict-metrics"),
+            str(tmp_path / "conflict-metrics"),
             "--timeout",
             "5",
             "--poll",
@@ -292,25 +324,22 @@ def test_unrelated_owner_is_not_killed(temp_root: Path) -> None:
             "0.10",
             expected=20,
         )
-        if unrelated.poll() is not None:
-            raise AssertionError("cleanup killed an unrelated endpoint owner")
-        if "unrelated process" not in completed.stderr:
-            raise AssertionError("unrelated endpoint conflict was not diagnosed")
-        print("[OK] adaptive cleanup aborts without killing an unrelated socket owner")
+        assert unrelated.poll() is None, "cleanup killed an unrelated endpoint owner"
+        assert "unrelated process" in completed.stderr
     finally:
         terminate(original)
         if unrelated is not None:
             terminate(unrelated)
 
 
-def test_pid_start_time_mismatch_is_not_signaled(temp_root: Path) -> None:
+def test_pid_start_time_mismatch_is_not_signaled(tmp_path: Path) -> None:
     unrelated, _ = start_child(TCP_CHILD, "0")
-    state = temp_root / "pid-reuse-state.json"
-    process_report = temp_root / "pid-reuse-processes.tsv"
-    socket_report = temp_root / "pid-reuse-sockets.tsv"
-    metrics = temp_root / "pid-reuse-metrics"
+    state = tmp_path / "pid-reuse-state.json"
+    process_report = tmp_path / "pid-reuse-processes.tsv"
+    socket_report = tmp_path / "pid-reuse-sockets.tsv"
+    metrics = tmp_path / "pid-reuse-metrics"
     try:
-        run(
+        run_helper(
             "capture",
             "--root-pid",
             str(unrelated.pid),
@@ -325,7 +354,8 @@ def test_pid_start_time_mismatch_is_not_signaled(temp_root: Path) -> None:
         captured["processes"][0]["start_time_ticks"] += 1
         captured["sockets"] = []
         state.write_text(json.dumps(captured), encoding="utf-8")
-        run(
+
+        run_helper(
             "cleanup",
             "--state",
             str(state),
@@ -344,26 +374,10 @@ def test_pid_start_time_mismatch_is_not_signaled(temp_root: Path) -> None:
             "--report-interval",
             "0.1",
         )
-        if unrelated.poll() is not None:
-            raise AssertionError("PID with a different start time was signaled")
-        print("[OK] PID reuse protection leaves a mismatched PID/start-time process untouched")
+        assert unrelated.poll() is None, "PID with a different start time was signaled"
     finally:
         terminate(unrelated)
 
 
-
-def main() -> int:
-    if not Path("/proc/net/tcp").is_file():
-        print("ERROR: Linux /proc socket tables are required", file=sys.stderr)
-        return 1
-    with tempfile.TemporaryDirectory(prefix="npb-dmtcp-cleanup-test-") as temp_dir:
-        temp_root = Path(temp_dir)
-        test_successful_cleanup(temp_root)
-        test_unrelated_owner_is_not_killed(temp_root)
-        test_pid_start_time_mismatch_is_not_signaled(temp_root)
-    print("[OK] controlled adaptive pre-restore cleanup tests passed")
-    return 0
-
-
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(pytest.main([__file__]))

@@ -12,6 +12,8 @@ from pathlib import Path
 import subprocess
 import tempfile
 
+import pytest
+
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 RUN_ONE = REPO_ROOT / "scripts" / "run_one.sh"
@@ -35,6 +37,7 @@ def run(command: list[str], env: dict[str, str]) -> subprocess.CompletedProcess[
             stdout=stdout_file,
             stderr=stderr_file,
             check=False,
+            timeout=45,
         )
         stdout_file.seek(0)
         stderr_file.seek(0)
@@ -55,7 +58,7 @@ def run(command: list[str], env: dict[str, str]) -> subprocess.CompletedProcess[
     return result
 
 
-def main() -> int:
+def test_run_resume_markers_and_cleanup() -> None:
     with tempfile.TemporaryDirectory(prefix="npb-run-resume-") as temp_text:
         temp = Path(temp_text)
         fake_bin = temp / "fake-bin"
@@ -110,7 +113,7 @@ def main() -> int:
         )
 
         first = run(
-            [str(RUN_ONE), "bt", "16", "baseline", "1", "keep-checkpoints"],
+            ["bash", str(RUN_ONE), "bt", "16", "baseline", "1", "keep-checkpoints"],
             env,
         )
         marker = run_dir / "SUCCESS.marker"
@@ -128,7 +131,7 @@ def main() -> int:
             raise AssertionError("resume did not report incomplete-directory replacement")
 
         second = run(
-            [str(RUN_ONE), "bt", "16", "baseline", "1", "keep-checkpoints"],
+            ["bash", str(RUN_ONE), "bt", "16", "baseline", "1", "keep-checkpoints"],
             env,
         )
         if counter.read_text(encoding="utf-8").strip() != "1":
@@ -136,9 +139,7 @@ def main() -> int:
         if "Skipping successfully completed run" not in second.stdout:
             raise AssertionError("completed-run skip was not reported")
 
-    print("[OK] run_one replaces incomplete runs, cleans before execution, marks success, and resumes")
-    return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(pytest.main([__file__]))

@@ -13,6 +13,8 @@ import subprocess
 import tempfile
 import textwrap
 
+import pytest
+
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 RUN_ONE = REPO_ROOT / "scripts" / "run_one.sh"
@@ -23,7 +25,7 @@ def make_executable(path: Path, text: str) -> None:
     path.chmod(0o755)
 
 
-def main() -> int:
+def test_bounded_same_checkpoint_restore_retry() -> None:
     with tempfile.TemporaryDirectory(prefix="npb-restore-retry-") as temp_text:
         temp = Path(temp_text)
         fake_bin = temp / "fake-bin"
@@ -221,6 +223,7 @@ def main() -> int:
              stderr_path.open("w", encoding="utf-8") as stderr_file:
             completed = subprocess.run(
                 [
+                    "bash",
                     str(RUN_ONE),
                     "cg",
                     "2",
@@ -297,12 +300,7 @@ def main() -> int:
                 "canonical restored stdout does not match the complete successful-attempt log"
             )
 
-    print(
-        "[OK] first restore attempt stalls, the same checkpoint succeeds on "
-        "attempt two, and final canonical logs are refreshed after application exit"
-    )
-    return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(pytest.main([__file__]))

@@ -11,6 +11,8 @@ from pathlib import Path
 import hashlib
 import re
 
+import pytest
+
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS = REPO_ROOT / "scripts"
@@ -21,16 +23,16 @@ def require(condition: bool, message: str) -> None:
         raise AssertionError(message)
 
 
-def main() -> int:
-    installer = (SCRIPTS / "install_dmtcp_mpich_env.sh").read_text()
-    config = (SCRIPTS / "experiment_config.sh").read_text()
-    run_all = (SCRIPTS / "run_all.sh").read_text()
-    run_one = (SCRIPTS / "run_one.sh").read_text()
-    summarizer = (SCRIPTS / "summarize_results.py").read_text()
-    cleanup = (SCRIPTS / "adaptive_pre_restore_cleanup.py").read_text()
-    reservation = (SCRIPTS / "restore_port_reservation.py").read_text()
-    receive_window = (SCRIPTS / "restore_tcp_receive_window.py").read_text()
-    readme = (REPO_ROOT / "README.md").read_text()
+def test_repository_contract() -> None:
+    installer = (SCRIPTS / "install_dmtcp_mpich_env.sh").read_text(encoding="utf-8")
+    config = (SCRIPTS / "experiment_config.sh").read_text(encoding="utf-8")
+    run_all = (SCRIPTS / "run_all.sh").read_text(encoding="utf-8")
+    run_one = (SCRIPTS / "run_one.sh").read_text(encoding="utf-8")
+    summarizer = (SCRIPTS / "summarize_results.py").read_text(encoding="utf-8")
+    cleanup = (SCRIPTS / "adaptive_pre_restore_cleanup.py").read_text(encoding="utf-8")
+    reservation = (SCRIPTS / "restore_port_reservation.py").read_text(encoding="utf-8")
+    receive_window = (SCRIPTS / "restore_tcp_receive_window.py").read_text(encoding="utf-8")
+    readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
     patch_dir = (
         REPO_ROOT
         / "patches"
@@ -44,8 +46,8 @@ def main() -> int:
     require(duplex_patch_path.is_file(), "duplex-refill patch asset is missing")
     require(not old_duplex_override.exists(), "obsolete full-source override remains")
 
-    backlog_patch = backlog_patch_path.read_text()
-    duplex_patch = duplex_patch_path.read_text()
+    backlog_patch = backlog_patch_path.read_text(encoding="utf-8")
+    duplex_patch = duplex_patch_path.read_text(encoding="utf-8")
     backlog_patch_sha256 = hashlib.sha256(backlog_patch_path.read_bytes()).hexdigest()
     duplex_patch_sha256 = hashlib.sha256(duplex_patch_path.read_bytes()).hexdigest()
     require(
@@ -296,9 +298,7 @@ def main() -> int:
     require("replace|skip|error" not in run_one + run_all, "old skip policy remains")
     require(not (REPO_ROOT / ".idea").exists(), ".idea directory is present")
 
-    print("[OK] repository contract: DMTCP patches, transactional restore sysctls, final logs, cleanup, retries, markers, resume, and current artifacts")
-    return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(pytest.main([__file__]))

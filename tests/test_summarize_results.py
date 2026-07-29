@@ -13,6 +13,8 @@ import subprocess
 import sys
 import tempfile
 
+import pytest
+
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SUMMARIZER = REPO_ROOT / "scripts" / "summarize_results.py"
@@ -76,7 +78,7 @@ def create_marked_cr(root: Path) -> None:
         write(run / name, value)
 
 
-def main() -> int:
+def test_summarizer_uses_markers_and_current_artifact_names() -> None:
     with tempfile.TemporaryDirectory(prefix="npb-summary-test-") as temp:
         root = Path(temp) / "results"
         output = Path(temp) / "summary"
@@ -99,6 +101,7 @@ def main() -> int:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=False,
+            timeout=30,
         )
         if completed.returncode != 0:
             raise AssertionError(
@@ -125,9 +128,7 @@ def main() -> int:
         if cr_row["checkpoint_restore_workflow_overhead_seconds"] != "14.000000000":
             raise AssertionError("current workflow metric was not read")
 
-    print("[OK] summarizer requires SUCCESS.marker and current directory/artifact names")
-    return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(pytest.main([__file__]))
