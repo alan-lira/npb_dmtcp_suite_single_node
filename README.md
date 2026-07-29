@@ -124,17 +124,17 @@ output/                         # generated; ignored by Git
 
 ## 1. Check the repository
 
-From the repository root:
-
-```bash
-./scripts/check_repository.sh
-```
-
 Ensure the repository scripts and tests are executable before running the
 checks:
 
 ```bash
 chmod +x scripts/*.sh scripts/*.py tests/*.py
+```
+
+From the repository root:
+
+```bash
+./scripts/check_repository.sh
 ```
 
 The checker validates Bash and Python syntax, executable permissions, unwanted
